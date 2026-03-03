@@ -1,0 +1,15 @@
+.canvas-container {
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+.loading-wrapper {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #0a0a0a;
+}
