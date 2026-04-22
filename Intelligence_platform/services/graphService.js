@@ -1,15 +1,37 @@
-// Task 7: Converts database rows into the Weighted Graph format for routing 
-const buildGraph = (rows) => {
-  const graph = {};
-  rows.forEach(row => {
-    // If source stop isn't in graph yet, add it
-    if (!graph[row.source]) {
-      graph[row.source] = {};
-    }
-    // Add the target stop and the travel time (the "weight")
-    graph[row.source][row.target] = parseFloat(row.travel_time);
-  });
-  return graph;
-};
+const { buildTransitGraph } = require('./graphBuilder');
 
-module.exports = { buildGraph };
+class GraphService {
+  constructor() {
+    this.cachedGraphs = new Map(); // Store graphs by cityId
+  }
+
+  /**
+   * Fetches the graph. If it's already in memory, returns it instantly.
+   * Otherwise, builds it from the DB and caches it.
+   */
+  async getGraph(pool, cityId) {
+    if (this.cachedGraphs.has(cityId)) {
+      return this.cachedGraphs.get(cityId);
+    }
+
+    const graph = await buildTransitGraph(pool, cityId);
+    this.cachedGraphs.set(cityId, graph);
+    return graph;
+  }
+
+  /**
+   * Clears the cache. Call this after data ingestion.
+   */
+  clearCache(cityId = null) {
+    if (cityId) {
+      this.cachedGraphs.delete(cityId);
+      console.log(`🧹 Cache cleared for city: ${cityId}`);
+    } else {
+      this.cachedGraphs.clear();
+      console.log("🧹 Global graph cache cleared.");
+    }
+  }
+}
+
+// Export as a Singleton to share cache across the entire app
+module.exports = new GraphService();

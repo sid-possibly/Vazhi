@@ -1,62 +1,54 @@
-// utils/routingEngine.js
+class MinHeap {
+  constructor() { this.heap = []; }
+  push(node, priority) {
+    this.heap.push({ node, priority });
+    this.heap.sort((a, b) => a.priority - b.priority); // simple; replace with proper heapify for scale
+  }
+  pop() { return this.heap.shift(); }
+  get size() { return this.heap.length; }
+}
 
-/**
- * Finds the fastest path between two stops[cite: 142, 278].
- * @param {Object} graph - Map of stop IDs and travel times.
- * @param {string} startNode - Origin stop_id.
- * @param {string} endNode - Destination stop_id.
- */
 const findShortestPath = (graph, startNode, endNode) => {
-    let distances = {};
-    distances[endNode] = "Infinity";
-    distances = Object.assign(distances, graph[startNode]);
+  const distances = {};
+  const prev = {};
+  const visited = new Set();
 
-    let parents = { endNode: null };
-    for (let child in graph[startNode]) {
-        parents[child] = startNode;
+  const allNodes = new Set([
+    ...Object.keys(graph),
+    ...Object.values(graph).flatMap(n => Object.keys(n))
+  ]);
+
+  allNodes.forEach(n => { distances[n] = Infinity; prev[n] = null; });
+  distances[startNode] = 0;
+
+  const pq = new MinHeap();
+  pq.push(startNode, 0);
+
+  while (pq.size > 0) {
+    const { node: u, priority } = pq.pop();
+    if (visited.has(u)) continue;
+    if (u === endNode) break;
+    visited.add(u);
+
+    if (!graph[u]) continue;
+    for (const [v, weight] of Object.entries(graph[u])) {
+      const alt = distances[u] + weight;
+      if (alt < distances[v]) {
+        distances[v] = alt;
+        prev[v] = u;
+        pq.push(v, alt);
+      }
     }
+  }
 
-    let visited = [];
-    let node = shortestDistanceNode(distances, visited);
+  const path = [];
+  let curr = endNode;
+  while (curr) { path.unshift(curr); curr = prev[curr]; }
 
-    while (node) {
-        let distance = distances[node];
-        let children = graph[node];
-        for (let child in children) {
-            if (String(child) === String(startNode)) continue;
-            let newdistance = distance + children[child];
-            if (!distances[child] || distances[child] > newdistance) {
-                distances[child] = newdistance;
-                parents[child] = node;
-            }
-        }
-        visited.push(node);
-        node = shortestDistanceNode(distances, visited);
-    }
-
-    let shortestPath = [endNode];
-    let parent = parents[endNode];
-    while (parent) {
-        shortestPath.push(parent);
-        parent = parents[parent];
-    }
-    shortestPath.reverse();
-
-    return {
-        path: shortestPath,
-        totalTime: distances[endNode]
-    };
-};
-
-const shortestDistanceNode = (distances, visited) => {
-    let shortest = null;
-    for (let node in distances) {
-        let isShortest = shortest === null || distances[node] < distances[shortest];
-        if (isShortest && !visited.includes(node)) {
-            shortest = node;
-        }
-    }
-    return shortest;
+  return {
+    path: path[0] === startNode ? path : [],
+    totalTime: distances[endNode]
+  };
 };
 
 module.exports = { findShortestPath };
