@@ -16,11 +16,11 @@ const { initCronJobs }     = require('./services/cronJobs');
 const graphService         = require('./services/graphService');
 const { getRedisClient }   = require('./services/redisClient');
 const { initGtfsPoller }   = require('./services/gtfsPoller');
+const transitRouter        = require('./routes/transitRoutes');
 
 const app    = express();
-const server = http.createServer(app); // Wrap express in an HTTP server for Socket.io
+const server = http.createServer(app);
 
-// Socket.io server — attached to the same HTTP server
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
@@ -33,20 +33,32 @@ console.log('🛠️  Vazhi Backend Starting...');
 const pool  = new Pool({ connectionString: process.env.DATABASE_URL });
 const redis = getRedisClient();
 
-// Kochi city UUID — poller needs this to scope its queries
 const KOCHI_CITY_ID = 'e79757c5-93d1-4230-85e3-90998123061c';
 
+// Inject pool into every request so routers can access it
+// without needing to import the pool directly
+app.use((req, res, next) => {
+  req.pool = pool;
+  next();
+});
+
 // ==========================================
-// SOCKET.IO CONNECTION HANDLER
+// SOCKET.IO
 // ==========================================
 
 io.on('connection', (socket) => {
   console.log(`🔌 Client connected: ${socket.id}`);
-
   socket.on('disconnect', () => {
     console.log(`🔌 Client disconnected: ${socket.id}`);
   });
 });
+
+// ==========================================
+// ROUTERS
+// ==========================================
+
+// Transit map data — routes, stops, arrivals
+app.use('/api/transit', transitRouter);
 
 // ==========================================
 // 1. JOURNEY PLANNER
@@ -66,8 +78,6 @@ app.post('/api/journey/plan', async (req, res) => {
   try {
     const graph = await graphService.getGraph(pool, cityId);
 
-    console.log(`📊 Graph ready with ${Object.keys(graph).length} stops`);
-
     if (Object.keys(graph).length === 0) {
       return res.status(404).json({ error: 'No transit data available for this city.' });
     }
@@ -81,7 +91,6 @@ app.post('/api/journey/plan', async (req, res) => {
     const result = findShortestPath(graph, startStopId, endStopId);
 
     if (result.totalTime === Infinity || result.path.length === 0) {
-      console.warn(`❌ No path found between ${startStopId} and ${endStopId}`);
       return res.status(404).json({
         error: 'No path found between these stops. Try different stops or check data ingestion.'
       });
@@ -106,14 +115,12 @@ app.post('/api/journey/plan', async (req, res) => {
 
 // ==========================================
 // 2. LIVE VEHICLE POSITIONS
-// Reads latest positions from Redis cache.
 // ==========================================
 
 app.get('/api/live/positions/:cityId', async (req, res) => {
   const { cityId } = req.params;
 
   try {
-    // Scan Redis for all position keys matching this city's routes
     const keys = await redis.keys('pos:*');
 
     if (keys.length === 0) {
@@ -189,7 +196,6 @@ app.post('/api/reports', async (req, res) => {
     return res.status(400).json({ error: 'Missing required report fields' });
   }
 
-  // Sanitize description — strip HTML tags
   description = description.replace(/<[^>]*>?/gm, '').trim();
 
   try {
@@ -201,11 +207,9 @@ app.post('/api/reports', async (req, res) => {
     );
 
     const report = result.rows[0];
-
-    // Broadcast new report to all connected clients in real-time
     io.emit('new_report', report);
-
     res.status(201).json(report);
+
   } catch (err) {
     console.error('Citizen report error:', err.message);
     res.status(500).json({ error: err.message });
@@ -218,7 +222,6 @@ app.post('/api/reports', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-// Use server.listen (not app.listen) so Socket.io shares the same port
 server.listen(PORT, () => {
   console.log(`✅ Vazhi Intelligence Engine running on http://localhost:${PORT}`);
 });
@@ -228,17 +231,11 @@ pool.connect((err, client, release) => {
     return console.error('❌ Database Connection Error:', err.stack);
   }
   console.log('✅ Successfully connected to PostgreSQL + PostGIS');
-
-  // Initialize background cron jobs (report expiry)
   initCronJobs(pool);
-
-  // Initialize GTFS position poller — broadcasts every 15s via Socket.io
   initGtfsPoller(pool, KOCHI_CITY_ID, redis, io);
-
   release();
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('🛑 Shutting down gracefully...');
   pool.end();

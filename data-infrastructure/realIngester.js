@@ -15,7 +15,23 @@ const formatGTFSTime = (timeStr) => {
 };
 
 /**
- * Ingests a full GTFS feed (routes, stops, trips, stop_times) for a
+ * Builds a PostGIS LINESTRING WKT string from an array of shape points.
+ * Points must already be sorted by shape_pt_sequence.
+ * Returns null if fewer than 2 points (can't form a line).
+ *
+ * @param {Array} points - Array of { shape_pt_lat, shape_pt_lon }
+ * @returns {string|null}
+ */
+const buildLineStringWKT = (points) => {
+  if (points.length < 2) return null;
+  const coords = points
+    .map(p => `${parseFloat(p.shape_pt_lon)} ${parseFloat(p.shape_pt_lat)}`)
+    .join(', ');
+  return `LINESTRING(${coords})`;
+};
+
+/**
+ * Ingests a full GTFS feed (routes, stops, trips, stop_times, shapes) for a
  * specific city + transport mode into PostgreSQL.
  *
  * @param {Pool}     pool          - pg Pool instance
@@ -83,7 +99,7 @@ const ingestGTFSForMode = async (pool, citySlug, modeType, folderPath, agencyFil
 
     // ── 2. STOPS ─────────────────────────────────────────────────────────
     // mode_id is intentionally NOT stored on stops.
-    // A stop can be served by multiple modes (e.g. a shared Bus + Water stop
+    // A stop can be served by multiple modes (e.g. shared Bus + Water stops
     // in the community feed). Mode is derived at query time via
     // schedules → routes → transport_modes.
     const stops = parse(
@@ -104,23 +120,78 @@ const ingestGTFSForMode = async (pool, citySlug, modeType, folderPath, agencyFil
 
     console.log(`   ✅ Stops ingested: ${stops.length}`);
 
-    // ── 3. TRIPS → build gtfs trip_id to internal route_id map ───────────
+    // ── 3. TRIPS → build maps for route and shape linking ─────────────────
     const trips = parse(
       fs.readFileSync(path.join(folderPath, 'trips.txt')),
       { columns: true, skip_empty_lines: true, trim: true }
     );
 
     const tripRouteMap = new Map(); // gtfs_trip_id → internal route_id
+    // shape_id → gtfs_route_id (first trip we see wins — one shape per route)
+    const shapeRouteMap = new Map();
 
     for (const t of trips) {
       if (routeMap.has(t.route_id)) {
         tripRouteMap.set(t.trip_id, routeMap.get(t.route_id));
+
+        // Map this shape to the route — only store the first occurrence
+        if (t.shape_id && !shapeRouteMap.has(t.shape_id)) {
+          shapeRouteMap.set(t.shape_id, t.route_id);
+        }
       }
     }
 
     console.log(`   ✅ Trips mapped: ${tripRouteMap.size}`);
+    console.log(`   ✅ Shapes to process: ${shapeRouteMap.size}`);
 
-    // ── 4. STOP_TIMES / SCHEDULES ────────────────────────────────────────
+    // ── 4. SHAPES → build LINESTRING and update route_shape ──────────────
+    // Read all shape points, group by shape_id, sort by sequence,
+    // build a LINESTRING WKT, then update the matching route row.
+    const shapesPath = path.join(folderPath, 'shapes.txt');
+
+    if (fs.existsSync(shapesPath)) {
+      const shapePoints = parse(
+        fs.readFileSync(shapesPath),
+        { columns: true, skip_empty_lines: true, trim: true }
+      );
+
+      // Group points by shape_id
+      const shapeMap = new Map();
+      for (const pt of shapePoints) {
+        if (!shapeMap.has(pt.shape_id)) shapeMap.set(pt.shape_id, []);
+        shapeMap.get(pt.shape_id).push(pt);
+      }
+
+      let shapesIngested = 0;
+
+      for (const [shapeId, points] of shapeMap) {
+        const gtfsRouteId = shapeRouteMap.get(shapeId);
+        if (!gtfsRouteId) continue; // Shape belongs to a filtered-out route
+
+        // Sort by sequence (handle both integer and float sequence values)
+        points.sort((a, b) =>
+          parseFloat(a.shape_pt_sequence) - parseFloat(b.shape_pt_sequence)
+        );
+
+        const wkt = buildLineStringWKT(points);
+        if (!wkt) continue;
+
+        await client.query(
+          `UPDATE routes
+           SET route_shape = ST_SetSRID(ST_GeomFromText($1), 4326)
+           WHERE gtfs_route_id = $2`,
+          [wkt, gtfsRouteId]
+        );
+
+        shapesIngested++;
+      }
+
+      console.log(`   ✅ Shapes ingested: ${shapesIngested}`);
+    } else {
+      console.log(`   ⚠️  No shapes.txt found — skipping shape ingestion.`);
+    }
+
+    // ── 5. STOP_TIMES / SCHEDULES ────────────────────────────────────────
     const stopTimes = parse(
       fs.readFileSync(path.join(folderPath, 'stop_times.txt')),
       { columns: true, skip_empty_lines: true, trim: true }
