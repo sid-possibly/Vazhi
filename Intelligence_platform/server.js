@@ -17,6 +17,8 @@ const graphService         = require('./services/graphService');
 const { getRedisClient }   = require('./services/redisClient');
 const { initGtfsPoller }   = require('./services/gtfsPoller');
 const { connectMongo }     = require('./services/mongoClient');
+const { protect }          = require('./middleware/authMiddleware');
+const { enrichJourney }    = require('./services/journeyEnricher');
 
 // Routers
 const transitRouter = require('./routes/transitRoutes');
@@ -69,10 +71,10 @@ app.use('/api/reports', reportsRouter);
 app.use('/api/user',    userRouter);
 
 // ==========================================
-// 1. JOURNEY PLANNER
+// 1. JOURNEY PLANNER (protected + enriched)
 // ==========================================
 
-app.post('/api/journey/plan', async (req, res) => {
+app.post('/api/journey/plan', protect, async (req, res) => {
   const { startStopId, endStopId, cityId } = req.body;
 
   if (!startStopId || !endStopId || !cityId) {
@@ -81,7 +83,7 @@ app.post('/api/journey/plan', async (req, res) => {
     });
   }
 
-  console.log(`🔍 Journey Request: ${startStopId} → ${endStopId} (City: ${cityId})`);
+  console.log(`🔍 Journey Request: ${startStopId} → ${endStopId} (City: ${cityId}) by user ${req.user.userId}`);
 
   try {
     const graph = await graphService.getGraph(pool, cityId);
@@ -96,6 +98,7 @@ app.post('/api/journey/plan', async (req, res) => {
       });
     }
 
+    // Run Dijkstra
     const result = findShortestPath(graph, startStopId, endStopId);
 
     if (result.totalTime === Infinity || result.path.length === 0) {
@@ -104,11 +107,13 @@ app.post('/api/journey/plan', async (req, res) => {
       });
     }
 
+    // Enrich flat path into structured legs
+    const enriched = await enrichJourney(pool, result.path, result.totalTime, cityId);
+
     res.json({
-      origin: startStopId,
+      origin:      startStopId,
       destination: endStopId,
-      optimalPath: result.path,
-      totalTravelTimeMinutes: parseFloat(result.totalTime).toFixed(2),
+      ...enriched,
       timestamp: new Date().toISOString()
     });
 
