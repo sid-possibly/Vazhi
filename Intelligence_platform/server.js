@@ -16,7 +16,12 @@ const { initCronJobs }     = require('./services/cronJobs');
 const graphService         = require('./services/graphService');
 const { getRedisClient }   = require('./services/redisClient');
 const { initGtfsPoller }   = require('./services/gtfsPoller');
-const transitRouter        = require('./routes/transitRoutes');
+const { connectMongo }     = require('./services/mongoClient');
+const { protect }          = require('./middleware/authMiddleware');
+
+// Routers
+const transitRouter = require('./routes/transitRoutes');
+const authRouter    = require('./routes/authRoutes');
 
 const app    = express();
 const server = http.createServer(app);
@@ -36,7 +41,6 @@ const redis = getRedisClient();
 const KOCHI_CITY_ID = 'e79757c5-93d1-4230-85e3-90998123061c';
 
 // Inject pool into every request so routers can access it
-// without needing to import the pool directly
 app.use((req, res, next) => {
   req.pool = pool;
   next();
@@ -57,7 +61,7 @@ io.on('connection', (socket) => {
 // ROUTERS
 // ==========================================
 
-// Transit map data — routes, stops, arrivals
+app.use('/api/auth',    authRouter);
 app.use('/api/transit', transitRouter);
 
 // ==========================================
@@ -186,13 +190,17 @@ app.get('/api/intelligence/weather', async (req, res) => {
 });
 
 // ==========================================
-// 4. CITIZEN REPORTS
+// 4. CITIZEN REPORTS (protected)
 // ==========================================
 
-app.post('/api/reports', async (req, res) => {
-  let { userId, category, description, lat, lng } = req.body;
+// protect middleware ensures only logged-in users can file reports
+app.post('/api/reports', protect, async (req, res) => {
+  let { category, description, lat, lng } = req.body;
 
-  if (!userId || !category || !description || !lat || !lng) {
+  // userId comes from the verified JWT, not the request body
+  const userId = req.user.userId;
+
+  if (!category || !description || !lat || !lng) {
     return res.status(400).json({ error: 'Missing required report fields' });
   }
 
@@ -235,6 +243,9 @@ pool.connect((err, client, release) => {
   initGtfsPoller(pool, KOCHI_CITY_ID, redis, io);
   release();
 });
+
+// Connect to MongoDB
+connectMongo();
 
 process.on('SIGTERM', () => {
   console.log('🛑 Shutting down gracefully...');
