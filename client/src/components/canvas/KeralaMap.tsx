@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useMemo } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import { Edges, Html } from '@react-three/drei';
+import { io } from 'socket.io-client';
 
 // 1. Core Interfaces
 interface GeoJSONFeature {
@@ -30,7 +31,6 @@ interface DistrictMeshProps {
 // 2. Cinematic Camera Rig
 function CameraRig({ zoomTarget }: { zoomTarget: THREE.Vector3 | null }) {
   const { camera, controls } = useThree();
-  
   const defaultPos = useMemo(() => new THREE.Vector3(0, -10, 45), []);
   const defaultTarget = useMemo(() => new THREE.Vector3(0, 0, 0), []);
 
@@ -40,15 +40,13 @@ function CameraRig({ zoomTarget }: { zoomTarget: THREE.Vector3 | null }) {
     const time = state.clock.elapsedTime;
 
     if (zoomTarget) {
-      // THE FIX: Less extreme Y-drop so the map stays centered in the frame
       targetCameraPos.set(
-        zoomTarget.x + Math.sin(time * 0.15) * 5, // Gentle drone pan
-        zoomTarget.y - 5,                         // Perfect isometric swoop height
-        zoomTarget.z + 15                         // Push in tight
+        zoomTarget.x + Math.sin(time * 0.15) * 5,
+        zoomTarget.y - 5,
+        zoomTarget.z + 15
       );
       targetLookAt.copy(zoomTarget);
     } else {
-      // THE WIDE SHOT
       targetCameraPos.set(
         defaultPos.x + Math.sin(time * 0.1) * 2,
         defaultPos.y + Math.cos(time * 0.1) * 1,
@@ -74,7 +72,21 @@ export default function KeralaMap() {
   const [districts, setDistricts] = useState<GeoJSONFeature[]>([]);
   const [activeDistrict, setActiveDistrict] = useState<string | null>(null);
   const [zoomTarget, setZoomTarget] = useState<THREE.Vector3 | null>(null);
+  const [liveBuses, setLiveBuses] = useState<Record<string, any>>({});
+  const [hoveredBus, setHoveredBus] = useState<string | null>(null); // Added state here
+  
   const groupRef = useRef<THREE.Group>(null);
+  const center = [76.5, 10.5]; 
+  const scale = 12;
+
+  useEffect(() => {
+    const socket = io('http://localhost:4000');
+    socket.on('connect', () => console.log('✅ Vazhi Intelligence: Link Established'));
+    socket.on('transit_update', (data) => {
+      setLiveBuses(prev => ({ ...prev, [data.vehicleId]: data }));
+    });
+    return () => { socket.disconnect(); };
+  }, []);
 
   useEffect(() => {
     fetch('/data/kerala_districts.json')
@@ -90,10 +102,6 @@ export default function KeralaMap() {
     groupRef.current.position.z = THREE.MathUtils.lerp(groupRef.current.position.z, -7, 0.02);
     groupRef.current.rotation.x = THREE.MathUtils.lerp(groupRef.current.rotation.x, -Math.PI / 3, 0.02);
     groupRef.current.rotation.z = THREE.MathUtils.lerp(groupRef.current.rotation.z, 0.5, 0.02);
-
-    if (groupRef.current.position.y > -0.5) {
-      groupRef.current.position.y += Math.sin(state.clock.elapsedTime * 1.5) * 0.003;
-    }
   });
 
   return (
@@ -106,7 +114,7 @@ export default function KeralaMap() {
         rotation={[-Math.PI, 0, -1]}
         onPointerMissed={() => {
           setActiveDistrict(null);
-          setZoomTarget(null); // Clicking void resets everything
+          setZoomTarget(null);
         }}
       >
         {districts.map((feature, index) => {
@@ -119,14 +127,58 @@ export default function KeralaMap() {
               isActive={activeDistrict === districtName}
               onClick={(centerPoint) => {
                 setActiveDistrict(districtName);
-                // Smart Pan: If already zoomed in, glide to the new district
                 if (zoomTarget) setZoomTarget(centerPoint);
               }}
               onDoubleClick={(centerPoint) => {
-                setActiveDistrict(districtName); // Ensure it highlights on double-click too
+                setActiveDistrict(districtName);
                 setZoomTarget(centerPoint);
               }}
             />
+          );
+        })}
+
+        {/* TRANSIT DATA LAYER - Traveller HUD Mode */}
+        {Object.values(liveBuses).map((bus: any) => {
+          const isZoomed = zoomTarget !== null;
+          const isHovered = hoveredBus === bus.vehicleId;
+          const x = (bus.lon - center[0]) * scale;
+          const y = (bus.lat - center[1]) * scale;
+          
+          return (
+            <group 
+              key={bus.vehicleId} 
+              position={[x, y, 1.2]}
+              onPointerOver={(e) => { e.stopPropagation(); setHoveredBus(bus.vehicleId); }}
+              onPointerOut={() => setHoveredBus(null)}
+            >
+              <mesh>
+                <sphereGeometry args={[isZoomed ? 0.05 : 0.08, 16, 16]} />
+                <meshBasicMaterial color={isHovered ? "#5ffcf4" : "#ef4444"} toneMapped={false} />
+              </mesh>
+
+              <Html distanceFactor={isZoomed ? 6 : 12} center position={[0, 0, 0.5]}>
+                <div className={`flex flex-col items-center transition-all duration-300 ${isZoomed ? 'scale-100' : 'scale-75 opacity-90'}`}>
+                  {/* ID Tag */}
+                  <div className={`px-2 py-0.5 rounded border transition-colors ${isHovered ? 'bg-cyan-500 border-white text-black' : 'bg-slate-950/90 border-red-500/50 text-red-400'}`}>
+                    <span className="font-mono text-[10px] font-bold">{bus.vehicleId}</span>
+                  </div>
+
+                  {/* Expanded Traveller Info (Only on Zoom/Hover) */}
+                  {(isZoomed || isHovered) && (
+                    <div className="mt-1 bg-slate-900/95 border border-teal-400/30 px-2 py-1 rounded backdrop-blur-md shadow-xl min-w-[80px]">
+                      <div className="text-white text-[8px] leading-tight flex flex-col items-center">
+                        <span className="text-teal-300 uppercase font-black tracking-tight text-center">
+                          {bus.stopName || 'Stationary'}
+                        </span>
+                        <span className="text-[7px] text-slate-400 mt-1 uppercase">
+                          Speed: {bus.speed} km/h
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </Html>
+            </group>
           );
         })}
       </group>
@@ -134,28 +186,47 @@ export default function KeralaMap() {
   );
 }
 
-// 4. Individual District Mesh Component
+// 4. Individual District Mesh Component (Unchanged)
 function DistrictMesh({ feature, districtName, isActive, onClick, onDoubleClick }: DistrictMeshProps) {
   const [hovered, setHovered] = useState(false);
   const meshGroupRef = useRef<THREE.Group>(null);
-
   const center = [76.5, 10.5]; 
   const scale = 12;
 
+  // 1. OSM Texture Loader with CORS fix
+  const osmTexture = useMemo(() => {
+    const loader = new THREE.TextureLoader();
+    loader.setCrossOrigin('anonymous'); // Critical for loading external tiles
+    
+    // Fetching the standard OSM tile
+    const tex = loader.load(
+      'https://tile.openstreetmap.org/10/760/480.png',
+      undefined,
+      undefined,
+      (err) => console.error("OSM Tile failed:", err)
+    );
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    return tex;
+  }, []);
+
+  // 2. Extrude Geometry with selective UV mapping
   const districtGeometries = useMemo<THREE.ExtrudeGeometry[]>(() => {
     try {
       const { geometry } = feature;
       const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates;
-
+      
       return polygons.map((polygon: any) => {
         const shape = new THREE.Shape();
         const exterior = polygon[0];
-        
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
         exterior.forEach(([lon, lat]: [number, number], i: number) => {
           const x = (lon - center[0]) * scale;
           const y = (lat - center[1]) * scale;
           if (i === 0) shape.moveTo(x, y);
           else shape.lineTo(x, y);
+          minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+          minY = Math.min(minY, y); maxY = Math.max(maxY, y);
         });
 
         if (polygon.length > 1) {
@@ -171,35 +242,46 @@ function DistrictMesh({ feature, districtName, isActive, onClick, onDoubleClick 
           }
         }
 
-        return new THREE.ExtrudeGeometry(shape, {
+        const geo = new THREE.ExtrudeGeometry(shape, {
           depth: 0.8,
           bevelEnabled: true,
-          bevelThickness: 0.05,
-          bevelSize: 0.05,
-          bevelSegments: 3
+          bevelThickness: 0.02,
+          bevelSize: 0.02,
         });
+
+        // REFINED UV LOGIC: Only project the map on the Top Face
+        const pos = geo.attributes.position;
+        const uvs = new Float32Array(pos.count * 2);
+        for (let i = 0; i < pos.count; i++) {
+          const x = pos.getX(i);
+          const y = pos.getY(i);
+          const z = pos.getZ(i);
+          
+          if (z > 0.75) { // If it's a vertex on the top surface
+            uvs[i * 2] = (x - minX) / (maxX - minX);
+            uvs[i * 2 + 1] = (y - minY) / (maxY - minY);
+          } else { // Vertex is on the sides or bottom
+            uvs[i * 2] = 0;
+            uvs[i * 2 + 1] = 0;
+          }
+        }
+        geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+        return geo;
       });
-    } catch (e) {
-      return [];
-    }
+    } catch (e) { return []; }
   }, [feature]);
 
   const tooltipPosition = useMemo(() => {
     if (!districtGeometries.length) return new THREE.Vector3(0, 0, 0);
     districtGeometries[0].computeBoundingBox();
     const bbox = districtGeometries[0].boundingBox;
-    if (!bbox) return new THREE.Vector3(0, 0, 0);
-    return new THREE.Vector3().addVectors(bbox.min, bbox.max).multiplyScalar(0.5).setZ(1.5);
+    return bbox ? new THREE.Vector3().addVectors(bbox.min, bbox.max).multiplyScalar(0.5).setZ(1.2) : new THREE.Vector3(0,0,0);
   }, [districtGeometries]);
 
   useFrame(() => {
     if (!meshGroupRef.current) return;
-    const targetZ = isActive ? 1.5 : hovered ? 0.5 : 0;
-    meshGroupRef.current.position.z = THREE.MathUtils.lerp(
-      meshGroupRef.current.position.z, 
-      targetZ, 
-      0.15 
-    );
+    const targetZ = isActive ? 1.5 : hovered ? 0.4 : 0;
+    meshGroupRef.current.position.z = THREE.MathUtils.lerp(meshGroupRef.current.position.z, targetZ, 0.1);
   });
 
   return (
@@ -207,8 +289,6 @@ function DistrictMesh({ feature, districtName, isActive, onClick, onDoubleClick 
       ref={meshGroupRef}
       onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
       onPointerOut={() => setHovered(false)}
-      
-      // THE FIX: Convert the local tooltip position to an absolute World Coordinate
       onClick={(e) => { 
         e.stopPropagation(); 
         if (meshGroupRef.current) {
@@ -223,43 +303,34 @@ function DistrictMesh({ feature, districtName, isActive, onClick, onDoubleClick 
           onDoubleClick(worldCenter);
         }
       }}
-      
-      onPointerEnter={() => document.body.style.cursor = 'pointer'}
-      onPointerLeave={() => document.body.style.cursor = 'auto'}
     >
       {districtGeometries.map((geo, i) => (
         <mesh key={i} geometry={geo}>
-          {/* UPGRADED: Physical Material for that high-end "Glassmorphic Resin" look */}
-          <meshPhysicalMaterial 
-            color={isActive ? "#5ffcf4" : hovered ? "#14b8a6" : "#0d9488"} 
-            emissive={isActive ? "#0d9488" : hovered ? "#0f766e" : "#042f2e"}
-            emissiveIntensity={isActive ? 2 : hovered ? 1.5 : 1}
-            roughness={isActive ? 0.1 : 0.3} // Smoother when clicked
-            metalness={0.8}
-            clearcoat={1.0} // Adds a highly polished "wet" layer on top of the metal
-            clearcoatRoughness={0.1}
-            transparent
-            opacity={0.85}
+          {/* Top Texture Material */}
+          <meshStandardMaterial 
+            attach="material-0" 
+            map={osmTexture} 
+            color={isActive ? "#ffffff" : hovered ? "#b2fefb" : "#334155"} 
+            roughness={0.6}
           />
-          {/* Edges adapt to hover/active state */}
+          {/* Side Surface Material (Solid Dark Blue/Grey) */}
+          <meshStandardMaterial 
+            attach="material-1" 
+            color="#0f172a" 
+            metalness={0.8}
+            roughness={0.2}
+          />
+          
           <Edges threshold={20}>
-            <meshBasicMaterial 
-              color={isActive ? "#ffffff" : hovered ? "#5ffcf4" : "#2dd4bf"} 
-              toneMapped={false} 
-            />
+            <meshBasicMaterial color={isActive ? "#5ffcf4" : hovered ? "#38bdf8" : "#1e293b"} toneMapped={false} />
           </Edges>
         </mesh>
       ))}
 
       {(hovered || isActive) && (
-        <Html 
-          position={tooltipPosition} 
-          center 
-          style={{ pointerEvents: 'none' }} 
-          zIndexRange={[100, 0]}
-        >
-          <div className="pointer-events-none bg-[#020617]/90 backdrop-blur-md border border-teal-500/50 px-3 py-1.5 rounded flex items-center gap-2 drop-shadow-[0_0_15px_rgba(45,212,191,0.5)] transform transition-transform scale-100 animate-in fade-in zoom-in duration-200">
-            <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-white animate-pulse' : 'bg-teal-400'}`} />
+        <Html position={tooltipPosition} center style={{ pointerEvents: 'none' }} zIndexRange={[100, 0]}>
+          <div className="pointer-events-none bg-[#020617]/90 backdrop-blur-md border border-sky-500/50 px-3 py-1.5 rounded flex items-center gap-2 shadow-[0_0_15px_rgba(56,189,248,0.4)]">
+            <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-white animate-pulse' : 'bg-sky-400'}`} />
             <span className="text-white text-xs font-bold uppercase tracking-widest whitespace-nowrap">
               {districtName}
             </span>
