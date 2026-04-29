@@ -1,22 +1,57 @@
 // routes/transitRoutes.js
-// API endpoints for the frontend map:
-//   GET /api/transit/:cityId/routes   — all routes with shapes as GeoJSON
-//   GET /api/transit/:cityId/stops    — all stops as GeoJSON
-//   GET /api/transit/stops/:stopId/arrivals — next arrivals at a stop
 
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
+
+// ==========================================
+// GET /api/transit/cities
+// Lists all available cities with their IDs,
+// center coordinates, status, and enabled modes.
+// Used by the frontend city selector.
+// ==========================================
+
+router.get('/cities', async (req, res) => {
+  try {
+    const { rows } = await req.pool.query(`
+      SELECT
+        c.city_id,
+        c.name,
+        c.slug,
+        c.current_status,
+        ST_X(c.center_coords) AS lng,
+        ST_Y(c.center_coords) AS lat,
+        JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'modeId',      tm.mode_id,
+            'type',        tm.type,
+            'isEnabled',   tm.is_enabled,
+            'dataSourceUrl', tm.data_source_url
+          )
+          ORDER BY tm.type
+        ) AS modes
+      FROM cities c
+      LEFT JOIN transport_modes tm ON tm.city_id = c.city_id
+      GROUP BY c.city_id, c.name, c.slug, c.current_status, c.center_coords
+      ORDER BY c.name
+    `);
+
+    res.json({ cities: rows });
+
+  } catch (err) {
+    console.error('Cities endpoint error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch cities' });
+  }
+});
 
 // ==========================================
 // GET /api/transit/:cityId/routes
-// Returns all routes for a city with their
-// polyline shapes as GeoJSON FeatureCollection.
-// Used by the frontend to draw route lines on the map.
+// All routes for a city as GeoJSON FeatureCollection.
+// Optional ?mode=Metro filter.
 // ==========================================
 
 router.get('/:cityId/routes', async (req, res) => {
   const { cityId } = req.params;
-  const { mode } = req.query; // Optional filter: ?mode=Metro
+  const { mode }   = req.query;
 
   try {
     let query = `
@@ -32,7 +67,6 @@ router.get('/:cityId/routes', async (req, res) => {
       WHERE tm.city_id = $1
         AND r.route_shape IS NOT NULL
     `;
-
     const params = [cityId];
 
     if (mode) {
@@ -44,16 +78,15 @@ router.get('/:cityId/routes', async (req, res) => {
 
     const { rows } = await req.pool.query(query, params);
 
-    // Build GeoJSON FeatureCollection
     const features = rows.map(row => ({
       type: 'Feature',
       geometry: JSON.parse(row.shape_geojson),
       properties: {
-        routeId:    row.route_id,
-        gtfsId:     row.gtfs_route_id,
-        shortName:  row.route_short_name,
-        color:      row.route_color,
-        mode:       row.mode
+        routeId:   row.route_id,
+        gtfsId:    row.gtfs_route_id,
+        shortName: row.route_short_name,
+        color:     row.route_color,
+        mode:      row.mode
       }
     }));
 
@@ -71,18 +104,15 @@ router.get('/:cityId/routes', async (req, res) => {
 
 // ==========================================
 // GET /api/transit/:cityId/stops
-// Returns all stops for a city as GeoJSON.
+// All stops for a city as GeoJSON.
 // Optional ?mode=Metro filter.
-// Used by the frontend to draw stop markers on the map.
 // ==========================================
 
 router.get('/:cityId/stops', async (req, res) => {
   const { cityId } = req.params;
-  const { mode } = req.query;
+  const { mode }   = req.query;
 
   try {
-    // Derive mode per stop via schedules → routes → transport_modes
-    // DISTINCT ON stops so multi-mode stops appear only once
     let query = `
       SELECT DISTINCT ON (s.stop_id)
         s.stop_id,
@@ -96,7 +126,6 @@ router.get('/:cityId/stops', async (req, res) => {
       JOIN transport_modes tm ON tm.mode_id = r.mode_id
       WHERE s.city_id = $1
     `;
-
     const params = [cityId];
 
     if (mode) {
@@ -112,10 +141,10 @@ router.get('/:cityId/stops', async (req, res) => {
       type: 'Feature',
       geometry: JSON.parse(row.geom_geojson),
       properties: {
-        stopId:   row.stop_id,
-        gtfsId:   row.gtfs_stop_id,
-        name:     row.stop_name,
-        mode:     row.mode
+        stopId: row.stop_id,
+        gtfsId: row.gtfs_stop_id,
+        name:   row.stop_name,
+        mode:   row.mode
       }
     }));
 
@@ -132,10 +161,75 @@ router.get('/:cityId/stops', async (req, res) => {
 });
 
 // ==========================================
+// GET /api/transit/:cityId/stops/search?q=aluva
+// Fuzzy stop name search using pg_trgm.
+// Returns matching stops with gtfsId for use
+// in the journey planner.
+// Optional ?mode=Metro to narrow results.
+// ==========================================
+
+router.get('/:cityId/stops/search', async (req, res) => {
+  const { cityId }    = req.params;
+  const { q, mode }   = req.query;
+
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Query must be at least 2 characters.' });
+  }
+
+  try {
+    let query = `
+      SELECT DISTINCT ON (s.stop_id)
+        s.stop_id,
+        s.gtfs_stop_id,
+        s.stop_name,
+        ST_Y(s.geom) AS lat,
+        ST_X(s.geom) AS lng,
+        tm.type AS mode,
+        similarity(s.stop_name, $2) AS score
+      FROM stops s
+      JOIN schedules sch ON sch.stop_id = s.stop_id
+      JOIN routes    r   ON r.route_id  = sch.route_id
+      JOIN transport_modes tm ON tm.mode_id = r.mode_id
+      WHERE s.city_id = $1
+        AND s.stop_name ILIKE $3
+    `;
+    const params = [cityId, q, `%${q.trim()}%`];
+
+    if (mode) {
+      query += ` AND tm.type = $4`;
+      params.push(mode);
+    }
+
+    // DISTINCT ON requires stop_id first in ORDER BY
+    query += ` ORDER BY s.stop_id, score DESC LIMIT 10`;
+
+    const { rows } = await req.pool.query(query, params);
+
+    // Re-sort by similarity score after deduplication
+    rows.sort((a, b) => b.score - a.score);
+
+    res.json({
+      query: q,
+      results: rows.map(row => ({
+        stopId: row.stop_id,
+        gtfsId: row.gtfs_stop_id,
+        name:   row.stop_name,
+        lat:    parseFloat(row.lat),
+        lng:    parseFloat(row.lng),
+        mode:   row.mode
+      }))
+    });
+
+  } catch (err) {
+    console.error('Stop search error:', err.message);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// ==========================================
 // GET /api/transit/stops/:gtfsStopId/arrivals
-// Returns the next N upcoming arrivals at a stop.
-// Uses current IST time against the schedules table.
-// Default: next 5 arrivals. Override with ?limit=10
+// Next N upcoming arrivals at a stop.
+// Default: 5. Override with ?limit=10
 // ==========================================
 
 router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
@@ -143,8 +237,7 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
   const limit = parseInt(req.query.limit) || 5;
 
   try {
-    // Get current time in IST as a TIME value PostgreSQL can compare against
-    const query = `
+    const { rows } = await req.pool.query(`
       SELECT
         sch.trip_id,
         sch.arrival_time,
@@ -153,7 +246,6 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
         r.route_short_name,
         r.route_color,
         tm.type AS mode,
-        -- Minutes until arrival from now (IST)
         ROUND(
           EXTRACT(EPOCH FROM (
             sch.arrival_time - (NOW() AT TIME ZONE 'Asia/Kolkata')::time
@@ -167,9 +259,7 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
         AND sch.arrival_time > (NOW() AT TIME ZONE 'Asia/Kolkata')::time
       ORDER BY sch.arrival_time
       LIMIT $2
-    `;
-
-    const { rows } = await req.pool.query(query, [gtfsStopId, limit]);
+    `, [gtfsStopId, limit]);
 
     if (rows.length === 0) {
       return res.json({
@@ -182,14 +272,14 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
     res.json({
       gtfsStopId,
       arrivals: rows.map(row => ({
-        tripId:       row.trip_id,
-        routeId:      row.gtfs_route_id,
-        routeName:    row.route_short_name,
-        routeColor:   row.route_color,
-        mode:         row.mode,
-        arrivalTime:  row.arrival_time,
+        tripId:        row.trip_id,
+        routeId:       row.gtfs_route_id,
+        routeName:     row.route_short_name,
+        routeColor:    row.route_color,
+        mode:          row.mode,
+        arrivalTime:   row.arrival_time,
         departureTime: row.departure_time,
-        minutesAway:  parseInt(row.minutes_away)
+        minutesAway:   parseInt(row.minutes_away)
       }))
     });
 

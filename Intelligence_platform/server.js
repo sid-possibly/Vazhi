@@ -17,11 +17,12 @@ const graphService         = require('./services/graphService');
 const { getRedisClient }   = require('./services/redisClient');
 const { initGtfsPoller }   = require('./services/gtfsPoller');
 const { connectMongo }     = require('./services/mongoClient');
-const { protect }          = require('./middleware/authMiddleware');
 
 // Routers
 const transitRouter = require('./routes/transitRoutes');
 const authRouter    = require('./routes/authRoutes');
+const reportsRouter = require('./routes/reportsRoutes');
+const userRouter    = require('./routes/userRoutes');
 
 const app    = express();
 const server = http.createServer(app);
@@ -40,9 +41,10 @@ const redis = getRedisClient();
 
 const KOCHI_CITY_ID = 'e79757c5-93d1-4230-85e3-90998123061c';
 
-// Inject pool into every request so routers can access it
+// Inject pool and io into every request so routers can access them
 app.use((req, res, next) => {
   req.pool = pool;
+  req.io   = io;
   next();
 });
 
@@ -63,6 +65,8 @@ io.on('connection', (socket) => {
 
 app.use('/api/auth',    authRouter);
 app.use('/api/transit', transitRouter);
+app.use('/api/reports', reportsRouter);
+app.use('/api/user',    userRouter);
 
 // ==========================================
 // 1. JOURNEY PLANNER
@@ -179,7 +183,7 @@ app.get('/api/intelligence/weather', async (req, res) => {
       })
     );
     res.json({
-      temp: response.data.main.temp,
+      temp:      response.data.main.temp,
       condition: response.data.weather[0].main,
       timestamp: new Date().toISOString()
     });
@@ -190,42 +194,7 @@ app.get('/api/intelligence/weather', async (req, res) => {
 });
 
 // ==========================================
-// 4. CITIZEN REPORTS (protected)
-// ==========================================
-
-// protect middleware ensures only logged-in users can file reports
-app.post('/api/reports', protect, async (req, res) => {
-  let { category, description, lat, lng } = req.body;
-
-  // userId comes from the verified JWT, not the request body
-  const userId = req.user.userId;
-
-  if (!category || !description || !lat || !lng) {
-    return res.status(400).json({ error: 'Missing required report fields' });
-  }
-
-  description = description.replace(/<[^>]*>?/gm, '').trim();
-
-  try {
-    const result = await pool.query(
-      `INSERT INTO citizen_reports (user_id_ref, category, description, location)
-       VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326))
-       RETURNING *`,
-      [userId, category, description, lng, lat]
-    );
-
-    const report = result.rows[0];
-    io.emit('new_report', report);
-    res.status(201).json(report);
-
-  } catch (err) {
-    console.error('Citizen report error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ==========================================
-// 5. SERVER STARTUP
+// 4. SERVER STARTUP
 // ==========================================
 
 const PORT = process.env.PORT || 5000;
@@ -244,7 +213,6 @@ pool.connect((err, client, release) => {
   release();
 });
 
-// Connect to MongoDB
 connectMongo();
 
 process.on('SIGTERM', () => {
