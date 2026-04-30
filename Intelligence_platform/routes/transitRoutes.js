@@ -1,123 +1,84 @@
 // routes/transitRoutes.js
-
 const express = require('express');
 const router  = express.Router();
+const { validateStopSearch } = require('../middleware/validation');
 
-// ==========================================
-// GET /api/transit/cities
-// Lists all available cities with their IDs,
-// center coordinates, status, and enabled modes.
-// Used by the frontend city selector.
-// ==========================================
+// ── GET /api/transit/cities ───────────────────────────────────────────────────
 
-router.get('/cities', async (req, res) => {
+router.get('/cities', async (req, res, next) => {
   try {
     const { rows } = await req.pool.query(`
       SELECT
-        c.city_id,
-        c.name,
-        c.slug,
-        c.current_status,
+        c.city_id, c.name, c.slug, c.current_status,
         ST_X(c.center_coords) AS lng,
         ST_Y(c.center_coords) AS lat,
         JSON_AGG(
           JSON_BUILD_OBJECT(
-            'modeId',      tm.mode_id,
-            'type',        tm.type,
-            'isEnabled',   tm.is_enabled,
+            'modeId',        tm.mode_id,
+            'type',          tm.type,
+            'isEnabled',     tm.is_enabled,
             'dataSourceUrl', tm.data_source_url
-          )
-          ORDER BY tm.type
+          ) ORDER BY tm.type
         ) AS modes
       FROM cities c
       LEFT JOIN transport_modes tm ON tm.city_id = c.city_id
       GROUP BY c.city_id, c.name, c.slug, c.current_status, c.center_coords
       ORDER BY c.name
     `);
-
     res.json({ cities: rows });
-
-  } catch (err) {
-    console.error('Cities endpoint error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch cities' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ==========================================
-// GET /api/transit/:cityId/routes
-// All routes for a city as GeoJSON FeatureCollection.
-// Optional ?mode=Metro filter.
-// ==========================================
+// ── GET /api/transit/:cityId/routes ──────────────────────────────────────────
 
-router.get('/:cityId/routes', async (req, res) => {
+router.get('/:cityId/routes', async (req, res, next) => {
   const { cityId } = req.params;
   const { mode }   = req.query;
 
   try {
     let query = `
       SELECT
-        r.route_id,
-        r.gtfs_route_id,
-        r.route_short_name,
-        r.route_color,
-        tm.type AS mode,
+        r.route_id, r.gtfs_route_id, r.route_short_name,
+        r.route_color, tm.type AS mode,
         ST_AsGeoJSON(r.route_shape) AS shape_geojson
       FROM routes r
       JOIN transport_modes tm ON tm.mode_id = r.mode_id
-      WHERE tm.city_id = $1
-        AND r.route_shape IS NOT NULL
+      WHERE tm.city_id = $1 AND r.route_shape IS NOT NULL
     `;
     const params = [cityId];
-
-    if (mode) {
-      query += ` AND tm.type = $2`;
-      params.push(mode);
-    }
-
+    if (mode) { query += ` AND tm.type = $2`; params.push(mode); }
     query += ` ORDER BY tm.type, r.route_short_name`;
 
     const { rows } = await req.pool.query(query, params);
 
-    const features = rows.map(row => ({
-      type: 'Feature',
-      geometry: JSON.parse(row.shape_geojson),
-      properties: {
-        routeId:   row.route_id,
-        gtfsId:    row.gtfs_route_id,
-        shortName: row.route_short_name,
-        color:     row.route_color,
-        mode:      row.mode
-      }
-    }));
-
     res.json({
       type: 'FeatureCollection',
-      features,
-      meta: { cityId, total: features.length }
+      features: rows.map(row => ({
+        type: 'Feature',
+        geometry: JSON.parse(row.shape_geojson),
+        properties: {
+          routeId:   row.route_id,
+          gtfsId:    row.gtfs_route_id,
+          shortName: row.route_short_name,
+          color:     row.route_color,
+          mode:      row.mode
+        }
+      })),
+      meta: { cityId, total: rows.length }
     });
-
-  } catch (err) {
-    console.error('Routes endpoint error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch routes' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ==========================================
-// GET /api/transit/:cityId/stops
-// All stops for a city as GeoJSON.
-// Optional ?mode=Metro filter.
-// ==========================================
+// ── GET /api/transit/:cityId/stops ────────────────────────────────────────────
 
-router.get('/:cityId/stops', async (req, res) => {
+router.get('/:cityId/stops', async (req, res, next) => {
   const { cityId } = req.params;
   const { mode }   = req.query;
 
   try {
     let query = `
       SELECT DISTINCT ON (s.stop_id)
-        s.stop_id,
-        s.gtfs_stop_id,
-        s.stop_name,
+        s.stop_id, s.gtfs_stop_id, s.stop_name,
         ST_AsGeoJSON(s.geom) AS geom_geojson,
         tm.type AS mode
       FROM stops s
@@ -127,85 +88,52 @@ router.get('/:cityId/stops', async (req, res) => {
       WHERE s.city_id = $1
     `;
     const params = [cityId];
-
-    if (mode) {
-      query += ` AND tm.type = $2`;
-      params.push(mode);
-    }
-
+    if (mode) { query += ` AND tm.type = $2`; params.push(mode); }
     query += ` ORDER BY s.stop_id, tm.type`;
 
     const { rows } = await req.pool.query(query, params);
 
-    const features = rows.map(row => ({
-      type: 'Feature',
-      geometry: JSON.parse(row.geom_geojson),
-      properties: {
-        stopId: row.stop_id,
-        gtfsId: row.gtfs_stop_id,
-        name:   row.stop_name,
-        mode:   row.mode
-      }
-    }));
-
     res.json({
       type: 'FeatureCollection',
-      features,
-      meta: { cityId, total: features.length }
+      features: rows.map(row => ({
+        type: 'Feature',
+        geometry: JSON.parse(row.geom_geojson),
+        properties: {
+          stopId: row.stop_id,
+          gtfsId: row.gtfs_stop_id,
+          name:   row.stop_name,
+          mode:   row.mode
+        }
+      })),
+      meta: { cityId, total: rows.length }
     });
-
-  } catch (err) {
-    console.error('Stops endpoint error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch stops' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ==========================================
-// GET /api/transit/:cityId/stops/search?q=aluva
-// Fuzzy stop name search using pg_trgm.
-// Returns matching stops with gtfsId for use
-// in the journey planner.
-// Optional ?mode=Metro to narrow results.
-// ==========================================
+// ── GET /api/transit/:cityId/stops/search ────────────────────────────────────
 
-router.get('/:cityId/stops/search', async (req, res) => {
-  const { cityId }    = req.params;
-  const { q, mode }   = req.query;
-
-  if (!q || q.trim().length < 2) {
-    return res.status(400).json({ error: 'Query must be at least 2 characters.' });
-  }
+router.get('/:cityId/stops/search', validateStopSearch, async (req, res, next) => {
+  const { cityId }  = req.params;
+  const { q, mode } = req.query;
 
   try {
     let query = `
       SELECT DISTINCT ON (s.stop_id)
-        s.stop_id,
-        s.gtfs_stop_id,
-        s.stop_name,
-        ST_Y(s.geom) AS lat,
-        ST_X(s.geom) AS lng,
+        s.stop_id, s.gtfs_stop_id, s.stop_name,
+        ST_Y(s.geom) AS lat, ST_X(s.geom) AS lng,
         tm.type AS mode,
         similarity(s.stop_name, $2) AS score
       FROM stops s
       JOIN schedules sch ON sch.stop_id = s.stop_id
       JOIN routes    r   ON r.route_id  = sch.route_id
       JOIN transport_modes tm ON tm.mode_id = r.mode_id
-      WHERE s.city_id = $1
-        AND s.stop_name ILIKE $3
+      WHERE s.city_id = $1 AND s.stop_name ILIKE $3
     `;
     const params = [cityId, q, `%${q.trim()}%`];
-
-    if (mode) {
-      query += ` AND tm.type = $4`;
-      params.push(mode);
-    }
-
-    // DISTINCT ON requires stop_id first in ORDER BY
+    if (mode) { query += ` AND tm.type = $4`; params.push(mode); }
     query += ` ORDER BY s.stop_id, score DESC LIMIT 10`;
 
     const { rows } = await req.pool.query(query, params);
-
-    // Re-sort by similarity score after deduplication
     rows.sort((a, b) => b.score - a.score);
 
     res.json({
@@ -219,32 +147,20 @@ router.get('/:cityId/stops/search', async (req, res) => {
         mode:   row.mode
       }))
     });
-
-  } catch (err) {
-    console.error('Stop search error:', err.message);
-    res.status(500).json({ error: 'Search failed' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ==========================================
-// GET /api/transit/stops/:gtfsStopId/arrivals
-// Next N upcoming arrivals at a stop.
-// Default: 5. Override with ?limit=10
-// ==========================================
+// ── GET /api/transit/stops/:gtfsStopId/arrivals ───────────────────────────────
 
-router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
+router.get('/stops/:gtfsStopId/arrivals', async (req, res, next) => {
   const { gtfsStopId } = req.params;
-  const limit = parseInt(req.query.limit) || 5;
+  const limit = Math.min(parseInt(req.query.limit) || 5, 20);
 
   try {
     const { rows } = await req.pool.query(`
       SELECT
-        sch.trip_id,
-        sch.arrival_time,
-        sch.departure_time,
-        r.gtfs_route_id,
-        r.route_short_name,
-        r.route_color,
+        sch.trip_id, sch.arrival_time, sch.departure_time,
+        r.gtfs_route_id, r.route_short_name, r.route_color,
         tm.type AS mode,
         ROUND(
           EXTRACT(EPOCH FROM (
@@ -261,17 +177,9 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
       LIMIT $2
     `, [gtfsStopId, limit]);
 
-    if (rows.length === 0) {
-      return res.json({
-        gtfsStopId,
-        arrivals: [],
-        message: 'No upcoming arrivals found for this stop today.'
-      });
-    }
-
     res.json({
       gtfsStopId,
-      arrivals: rows.map(row => ({
+      arrivals: rows.length === 0 ? [] : rows.map(row => ({
         tripId:        row.trip_id,
         routeId:       row.gtfs_route_id,
         routeName:     row.route_short_name,
@@ -280,13 +188,10 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res) => {
         arrivalTime:   row.arrival_time,
         departureTime: row.departure_time,
         minutesAway:   parseInt(row.minutes_away)
-      }))
+      })),
+      message: rows.length === 0 ? 'No upcoming arrivals found for this stop today.' : undefined
     });
-
-  } catch (err) {
-    console.error('Arrivals endpoint error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch arrivals' });
-  }
+  } catch (err) { next(err); }
 });
 
 module.exports = router;

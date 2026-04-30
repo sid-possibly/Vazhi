@@ -1,21 +1,12 @@
 // routes/reportsRoutes.js
-// Citizen report endpoints:
-//   GET  /api/reports          — fetch reports near a location
-//   POST /api/reports          — file a new report (protected)
-//   POST /api/reports/:id/upvote — upvote a report (protected)
-
-const express    = require('express');
-const router     = express.Router();
+const express     = require('express');
+const router      = express.Router();
 const { protect } = require('../middleware/authMiddleware');
+const { validateReport } = require('../middleware/validation');
 
-// ==========================================
-// GET /api/reports
-// Fetch active citizen reports near a location.
-// Required query params: lat, lng
-// Optional: radius (metres, default 2000), limit (default 50)
-// ==========================================
+// ── GET /api/reports ──────────────────────────────────────────────────────────
 
-router.get('/', async (req, res) => {
+router.get('/', async (req, res, next) => {
   const { lat, lng, radius = 2000, limit = 50 } = req.query;
 
   if (!lat || !lng) {
@@ -25,13 +16,8 @@ router.get('/', async (req, res) => {
   try {
     const { rows } = await req.pool.query(`
       SELECT
-        report_id,
-        user_id_ref,
-        category,
-        description,
-        upvotes,
-        expires_at,
-        created_at,
+        report_id, user_id_ref, category, description,
+        upvotes, expires_at, created_at,
         ST_Y(location) AS lat,
         ST_X(location) AS lng,
         ST_Distance(
@@ -51,7 +37,7 @@ router.get('/', async (req, res) => {
     `, [parseFloat(lat), parseFloat(lng), parseInt(radius), parseInt(limit)]);
 
     res.json({
-      total: rows.length,
+      total:   rows.length,
       reports: rows.map(row => ({
         reportId:       row.report_id,
         userId:         row.user_id_ref,
@@ -65,40 +51,16 @@ router.get('/', async (req, res) => {
         distanceMetres: Math.round(parseFloat(row.distance_metres))
       }))
     });
-
-  } catch (err) {
-    console.error('Reports feed error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch reports' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ==========================================
-// POST /api/reports
-// File a new citizen report.
-// Requires JWT auth.
-// ==========================================
+// ── POST /api/reports ─────────────────────────────────────────────────────────
 
-router.post('/', protect, async (req, res) => {
+router.post('/', protect, validateReport, async (req, res, next) => {
   let { category, description, lat, lng } = req.body;
-  const userId = req.user.userId; // from JWT
+  const userId = req.user.userId;
 
-  if (!category || !description || !lat || !lng) {
-    return res.status(400).json({ error: 'category, description, lat and lng are required.' });
-  }
-
-  const validCategories = ['Overcrowded', 'Infrastructure', 'Missed', 'Unsafe'];
-  if (!validCategories.includes(category)) {
-    return res.status(400).json({
-      error: `category must be one of: ${validCategories.join(', ')}`
-    });
-  }
-
-  // Sanitize — strip HTML tags
   description = description.replace(/<[^>]*>?/gm, '').trim();
-
-  if (description.length < 5) {
-    return res.status(400).json({ error: 'Description too short.' });
-  }
 
   try {
     const { rows } = await req.pool.query(`
@@ -111,49 +73,28 @@ router.post('/', protect, async (req, res) => {
     `, [userId, category, description, parseFloat(lng), parseFloat(lat)]);
 
     const report = rows[0];
-
-    // Broadcast to all connected Socket.io clients
     req.io.emit('new_report', report);
-
     res.status(201).json(report);
-
-  } catch (err) {
-    console.error('File report error:', err.message);
-    res.status(500).json({ error: 'Failed to file report.' });
-  }
+  } catch (err) { next(err); }
 });
 
-// ==========================================
-// POST /api/reports/:reportId/upvote
-// Upvote a citizen report.
-// Requires JWT auth.
-// ==========================================
+// ── POST /api/reports/:reportId/upvote ────────────────────────────────────────
 
-router.post('/:reportId/upvote', protect, async (req, res) => {
+router.post('/:reportId/upvote', protect, async (req, res, next) => {
   const { reportId } = req.params;
-
   try {
     const { rows } = await req.pool.query(`
       UPDATE citizen_reports
       SET upvotes = upvotes + 1
-      WHERE report_id = $1
-        AND expires_at > NOW()
+      WHERE report_id = $1 AND expires_at > NOW()
       RETURNING report_id, upvotes
     `, [reportId]);
 
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Report not found or has expired.' });
     }
-
-    res.json({
-      reportId: rows[0].report_id,
-      upvotes:  rows[0].upvotes
-    });
-
-  } catch (err) {
-    console.error('Upvote error:', err.message);
-    res.status(500).json({ error: 'Failed to upvote report.' });
-  }
+    res.json({ reportId: rows[0].report_id, upvotes: rows[0].upvotes });
+  } catch (err) { next(err); }
 });
 
 module.exports = router;
