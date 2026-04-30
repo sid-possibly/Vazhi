@@ -25,6 +25,7 @@ const transitRouter = require('./routes/transitRoutes');
 const authRouter    = require('./routes/authRoutes');
 const reportsRouter = require('./routes/reportsRoutes');
 const userRouter    = require('./routes/userRoutes');
+const alertsRouter  = require('./routes/alertsRoutes');
 
 const app    = express();
 const server = http.createServer(app);
@@ -69,6 +70,7 @@ app.use('/api/auth',    authRouter);
 app.use('/api/transit', transitRouter);
 app.use('/api/reports', reportsRouter);
 app.use('/api/user',    userRouter);
+app.use('/api/alerts',  alertsRouter);
 
 // ==========================================
 // 1. JOURNEY PLANNER (protected + enriched)
@@ -98,7 +100,6 @@ app.post('/api/journey/plan', protect, async (req, res) => {
       });
     }
 
-    // Run Dijkstra
     const result = findShortestPath(graph, startStopId, endStopId);
 
     if (result.totalTime === Infinity || result.path.length === 0) {
@@ -107,7 +108,6 @@ app.post('/api/journey/plan', protect, async (req, res) => {
       });
     }
 
-    // Enrich flat path into structured legs
     const enriched = await enrichJourney(pool, result.path, result.totalTime, cityId);
 
     res.json({
