@@ -9,36 +9,36 @@ const { Pool }     = require('pg');
 const cors         = require('cors');
 const helmet       = require('helmet');
 const rateLimit    = require('express-rate-limit');
-const axios        = require('axios');
+const swaggerUi    = require('swagger-ui-express');
+const swaggerSpec  = require('./config/swaggerConfig');
 
 // Internal imports
-const { findShortestPath } = require('./utils/routingEngine');
-const { fetchWithRetry }   = require('./utils/apiWrapper');
-const { initCronJobs }     = require('./services/cronJobs');
-const graphService         = require('./services/graphService');
-const { getRedisClient }   = require('./services/redisClient');
-const { initGtfsPoller }   = require('./services/gtfsPoller');
-const { connectMongo }     = require('./services/mongoClient');
-const { protect }          = require('./middleware/authMiddleware');
-const { enrichJourney }    = require('./services/journeyEnricher');
-const { errorHandler }     = require('./middleware/errorHandler');
+const { findShortestPath }    = require('./utils/routingEngine');
+const { initCronJobs }        = require('./services/cronJobs');
+const graphService            = require('./services/graphService');
+const { getRedisClient }      = require('./services/redisClient');
+const { initGtfsPoller }      = require('./services/gtfsPoller');
+const { connectMongo }        = require('./services/mongoClient');
+const { protect }             = require('./middleware/authMiddleware');
+const { enrichJourney }       = require('./services/journeyEnricher');
+const { errorHandler }        = require('./middleware/errorHandler');
 const { validateJourneyPlan } = require('./middleware/validation');
 
 // Routers
-const transitRouter = require('./routes/transitRoutes');
-const authRouter    = require('./routes/authRoutes');
-const reportsRouter = require('./routes/reportsRoutes');
-const userRouter    = require('./routes/userRoutes');
-const alertsRouter  = require('./routes/alertsRoutes');
+const transitRouter      = require('./routes/transitRoutes');
+const authRouter         = require('./routes/authRoutes');
+const reportsRouter      = require('./routes/reportsRoutes');
+const userRouter         = require('./routes/userRoutes');
+const alertsRouter       = require('./routes/alertsRoutes');
+const analyticsRouter    = require('./routes/analyticsRoutes');
+const intelligenceRouter = require('./routes/intelligenceRoutes');
+const overviewRouter     = require('./routes/overviewRoutes');
+const comparisonRouter   = require('./routes/comparisonRoutes');
 
 const app    = express();
 const server = http.createServer(app);
 
-// ==========================================
-// CORS
-// In production, restrict to the actual frontend URL.
-// In development, allow all origins.
-// ==========================================
+// ── CORS ──────────────────────────────────────────────────────────────────────
 
 const allowedOrigins = process.env.FRONTEND_URL
   ? [process.env.FRONTEND_URL]
@@ -46,7 +46,6 @@ const allowedOrigins = process.env.FRONTEND_URL
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
     callback(new Error(`CORS policy: origin ${origin} not allowed.`));
@@ -55,38 +54,27 @@ app.use(cors({
   credentials: true
 }));
 
-// ==========================================
-// HELMET — HTTP security headers
-// ==========================================
+// ── HELMET ────────────────────────────────────────────────────────────────────
 
-app.use(helmet());
+app.use(helmet({ contentSecurityPolicy: false }));
 
-// ==========================================
-// RATE LIMITING
-// ==========================================
+// ── RATE LIMITING ─────────────────────────────────────────────────────────────
 
-// Strict limit on auth endpoints — 20 requests per 15 minutes per IP
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max:      20,
-  message:  { error: 'Too many requests from this IP. Please try again later.' },
-  standardHeaders: true,
-  legacyHeaders:   false
+  windowMs: 15 * 60 * 1000, max: 20,
+  message:         { error: 'Too many requests. Please try again later.' },
+  standardHeaders: true, legacyHeaders: false
 });
 
-// General API limit — 200 requests per 15 minutes per IP
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max:      200,
-  message:  { error: 'Too many requests from this IP. Please try again later.' },
-  standardHeaders: true,
-  legacyHeaders:   false
+  windowMs: 15 * 60 * 1000, max: 200,
+  message:         { error: 'Too many requests. Please try again later.' },
+  standardHeaders: true, legacyHeaders: false
 });
 
-app.use('/api/auth',    authLimiter);
-app.use('/api',         generalLimiter);
-
-app.use(express.json({ limit: '10kb' })); // Limit body size to prevent payload attacks
+app.use('/api/auth', authLimiter);
+app.use('/api',      generalLimiter);
+app.use(express.json({ limit: '10kb' }));
 
 console.log('🛠️  Vazhi Backend Starting...');
 
@@ -95,12 +83,8 @@ const redis = getRedisClient();
 
 const KOCHI_CITY_ID = 'e79757c5-93d1-4230-85e3-90998123061c';
 
-// Socket.io — allow same origins as CORS
 const io = new Server(server, {
-  cors: {
-    origin:  allowedOrigins,
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: allowedOrigins, methods: ['GET', 'POST'] }
 });
 
 // Inject pool and io into every request
@@ -110,30 +94,49 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==========================================
-// SOCKET.IO
-// ==========================================
+// ── SWAGGER UI ────────────────────────────────────────────────────────────────
+
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customSiteTitle: 'Vazhi API Docs',
+  customCss:       '.swagger-ui .topbar { background-color: #1a1a2e; }',
+  swaggerOptions:  { persistAuthorization: true }
+}));
+
+app.get('/api/docs.json', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.send(swaggerSpec);
+});
+
+console.log('📖 API Docs available at http://localhost:5000/api/docs');
+
+// ── SOCKET.IO ─────────────────────────────────────────────────────────────────
 
 io.on('connection', (socket) => {
   console.log(`🔌 Client connected: ${socket.id}`);
+
+  socket.on('join_journey', (sessionId) => {
+    socket.join(`journey:${sessionId}`);
+    console.log(`🗺️  Socket ${socket.id} joined journey session: ${sessionId}`);
+  });
+
   socket.on('disconnect', () => {
     console.log(`🔌 Client disconnected: ${socket.id}`);
   });
 });
 
-// ==========================================
-// ROUTERS
-// ==========================================
+// ── ROUTERS ───────────────────────────────────────────────────────────────────
 
-app.use('/api/auth',    authRouter);
-app.use('/api/transit', transitRouter);
-app.use('/api/reports', reportsRouter);
-app.use('/api/user',    userRouter);
-app.use('/api/alerts',  alertsRouter);
+app.use('/api/auth',         authRouter);
+app.use('/api/transit',      transitRouter);
+app.use('/api/reports',      reportsRouter);
+app.use('/api/user',         userRouter);
+app.use('/api/alerts',       alertsRouter);
+app.use('/api/analytics',    analyticsRouter);
+app.use('/api/intelligence', intelligenceRouter);
+app.use('/api/overview',     overviewRouter);
+app.use('/api/comparison',   comparisonRouter);
 
-// ==========================================
-// 1. JOURNEY PLANNER (protected + enriched)
-// ==========================================
+// ── JOURNEY PLANNER ───────────────────────────────────────────────────────────
 
 app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, next) => {
   const { startStopId, endStopId, cityId } = req.body;
@@ -144,27 +147,52 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
     const graph = await graphService.getGraph(pool, cityId);
 
     if (Object.keys(graph).length === 0) {
-      return res.status(404).json({ error: 'No transit data available for this city.' });
+      return res.status(404).json({ success: false, message: 'No transit data available for this city.' });
     }
     if (!graph[startStopId]) {
-      return res.status(404).json({
-        error: `Start stop '${startStopId}' not found in transit graph.`
-      });
+      return res.status(404).json({ success: false, message: `Start stop '${startStopId}' not found in transit graph.` });
     }
 
     const result = findShortestPath(graph, startStopId, endStopId);
 
-    if (result.totalTime === Infinity || result.path.length === 0) {
-      return res.status(404).json({
-        error: 'No path found between these stops.'
+    // Phase 1, Task 1 Fix: Handle no path found gracefully
+    if (!result.success || result.totalTime === Infinity || result.path.length === 0) {
+      return res.status(200).json({ 
+        success: false, 
+        message: 'No transit path found between these locations. Try adjusting your start or end points.',
+        fallback: 'GTFS Real-time or static data may be unavailable for this specific route.'
       });
     }
 
     const enriched = await enrichJourney(pool, result.path, result.totalTime, cityId);
 
+    const routeIds = enriched.legs
+      .filter(l => l.type === 'transit')
+      .map(l => l.routeId);
+
+    let sessionId = null;
+    if (routeIds.length > 0) {
+      const { rows } = await pool.query(`
+        INSERT INTO journey_sessions
+          (user_id, socket_id, route_ids, start_stop_id, end_stop_id, city_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING session_id
+      `, [
+        req.user.userId,
+        req.headers['x-socket-id'] || 'unknown',
+        routeIds,
+        startStopId,
+        endStopId,
+        cityId
+      ]);
+      sessionId = rows[0]?.session_id;
+    }
+
     res.json({
+      success: true,
       origin:      startStopId,
       destination: endStopId,
+      sessionId,   
       ...enriched,
       timestamp: new Date().toISOString()
     });
@@ -172,9 +200,7 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
   } catch (err) { next(err); }
 });
 
-// ==========================================
-// 2. LIVE VEHICLE POSITIONS
-// ==========================================
+// ── LIVE VEHICLE POSITIONS ────────────────────────────────────────────────────
 
 app.get('/api/live/positions/:cityId', async (req, res, next) => {
   const { cityId } = req.params;
@@ -183,9 +209,9 @@ app.get('/api/live/positions/:cityId', async (req, res, next) => {
     if (keys.length === 0) {
       return res.json({ cityId, positions: [], message: 'No active vehicles at this time.' });
     }
-    const pipeline = redis.pipeline();
+    const pipeline  = redis.pipeline();
     keys.forEach(key => pipeline.get(key));
-    const results  = await pipeline.exec();
+    const results   = await pipeline.exec();
     const positions = results
       .map(([err, val]) => (err || !val ? null : JSON.parse(val)))
       .filter(Boolean);
@@ -193,52 +219,11 @@ app.get('/api/live/positions/:cityId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ==========================================
-// 3. INTELLIGENCE LAYERS
-// ==========================================
-
-app.get('/api/intelligence/aqi', async (req, res, next) => {
-  const { city = 'Kochi' } = req.query;
-  try {
-    const response = await fetchWithRetry(() =>
-      axios.get('https://api.openaq.org/v2/latest', {
-        params:  { city, parameter: ['pm25', 'pm10'] },
-        headers: { 'X-API-Key': process.env.OPENAQ_KEY }
-      })
-    );
-    res.json({ city, data: response.data.results });
-  } catch (err) { next(err); }
-});
-
-app.get('/api/intelligence/weather', async (req, res, next) => {
-  const { lat, lng } = req.query;
-  if (!lat || !lng) {
-    return res.status(400).json({ error: 'lat and lng are required.' });
-  }
-  try {
-    const response = await fetchWithRetry(() =>
-      axios.get('https://api.openweathermap.org/data/2.5/weather', {
-        params: { lat, lon: lng, appid: process.env.WEATHER_KEY, units: 'metric' }
-      })
-    );
-    res.json({
-      temp:      response.data.main.temp,
-      condition: response.data.weather[0].main,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) { next(err); }
-});
-
-// ==========================================
-// GLOBAL ERROR HANDLER
-// Must be registered last — after all routes.
-// ==========================================
+// ── GLOBAL ERROR HANDLER ──────────────────────────────────────────────────────
 
 app.use(errorHandler);
 
-// ==========================================
-// SERVER STARTUP
-// ==========================================
+// ── SERVER STARTUP ────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 
@@ -250,7 +235,7 @@ pool.connect((err, client, release) => {
   if (err) return console.error('❌ Database Connection Error:', err.stack);
   console.log('✅ Successfully connected to PostgreSQL + PostGIS');
   initCronJobs(pool);
-  initGtfsPoller(pool, KOCHI_CITY_ID, redis, io);
+  initGtfsPoller(pool, KOCHI_CITY_ID, redis, io, graphService);
   release();
 });
 

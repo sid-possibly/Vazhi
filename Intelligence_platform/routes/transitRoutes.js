@@ -7,11 +7,13 @@ const { validateStopSearch } = require('../middleware/validation');
 
 router.get('/cities', async (req, res, next) => {
   try {
+    // Phase 1, Task 5: Added lastUpdated query using sub-select
     const { rows } = await req.pool.query(`
       SELECT
         c.city_id, c.name, c.slug, c.current_status,
         ST_X(c.center_coords) AS lng,
         ST_Y(c.center_coords) AS lat,
+        (SELECT MAX(last_ingested_at) FROM gtfs_feed_metadata WHERE city_id = c.city_id) AS "lastUpdated",
         JSON_AGG(
           JSON_BUILD_OBJECT(
             'modeId',        tm.mode_id,

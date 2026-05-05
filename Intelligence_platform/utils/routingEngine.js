@@ -1,8 +1,9 @@
+// utils/routingEngine.js
 class MinHeap {
   constructor() { this.heap = []; }
   push(node, priority) {
     this.heap.push({ node, priority });
-    this.heap.sort((a, b) => a.priority - b.priority); // simple; replace with proper heapify for scale
+    this.heap.sort((a, b) => a.priority - b.priority); 
   }
   pop() { return this.heap.shift(); }
   get size() { return this.heap.length; }
@@ -27,7 +28,7 @@ const findShortestPath = (graph, startNode, endNode) => {
   while (pq.size > 0) {
     const { node: u, priority } = pq.pop();
     if (visited.has(u)) continue;
-    if (u === endNode) break;
+    if (u === endNode) break; // Destination reached
     visited.add(u);
 
     if (!graph[u]) continue;
@@ -41,13 +42,26 @@ const findShortestPath = (graph, startNode, endNode) => {
     }
   }
 
+  // Phase 1, Task 1 Fix: Safely handle unreachable destinations
+  if (distances[endNode] === Infinity) {
+    return {
+      path: [],
+      totalTime: Infinity,
+      success: false
+    };
+  }
+
   const path = [];
   let curr = endNode;
-  while (curr) { path.unshift(curr); curr = prev[curr]; }
+  while (curr) { 
+    path.unshift(curr); 
+    curr = prev[curr]; 
+  }
 
   return {
     path: path[0] === startNode ? path : [],
-    totalTime: distances[endNode]
+    totalTime: distances[endNode],
+    success: true
   };
 };
 
