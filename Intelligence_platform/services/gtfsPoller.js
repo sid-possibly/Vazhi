@@ -130,6 +130,7 @@ const interpolatePositions = async (pool, cityId) => {
     if (!prevStop) {
       const last = stops[stops.length - 1];
       positions.push({
+        cityId,
         tripId:       trip.tripId,
         routeId:      trip.gtfsRouteId,
         internalRouteId: trip.routeId,
@@ -154,6 +155,7 @@ const interpolatePositions = async (pool, cityId) => {
     );
 
     positions.push({
+      cityId,
       tripId:          trip.tripId,
       routeId:         trip.gtfsRouteId,
       internalRouteId: trip.routeId,
@@ -233,7 +235,7 @@ const pollAndBroadcast = async (pool, cityId, redis, io) => {
     // Write positions to Redis with 15s TTL
     const pipeline = redis.pipeline();
     for (const pos of positions) {
-      const key = `pos:${pos.routeId}:${pos.tripId}`;
+      const key = `pos:${cityId}:${pos.routeId}:${pos.tripId}`;
       pipeline.set(key, JSON.stringify(pos), 'EX', POLL_INTERVAL_SECONDS);
     }
     await pipeline.exec();

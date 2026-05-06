@@ -1,12 +1,14 @@
 import { useState } from 'react';
 import LoadingScreen from './components/ui/LoadingScreen';
+import IntelligencePanel from './components/ui/IntelligencePanel';
 import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Stars, Sky } from '@react-three/drei';
+import { OrbitControls } from '@react-three/drei';
 import KeralaMap from './components/canvas/KeralaMap';
 import './App.css';
 
 function App() {
   const [loading, setLoading] = useState(true);
+  const [selectedDistrict, setSelectedDistrict] = useState<string | null>(null);
 
   return (
     <div className="w-full h-screen relative bg-[#020617] overflow-hidden">
@@ -34,7 +36,7 @@ function App() {
           <ambientLight intensity={0.2} />
           <pointLight position={[10, 10, 10]} intensity={1.5} color="#2dd4bf" />
 
-          <KeralaMap />
+          <KeralaMap onDistrictSelect={setSelectedDistrict} />
 
           <OrbitControls 
             makeDefault // <-- THIS IS CRUCIAL
@@ -53,6 +55,8 @@ function App() {
             </h1>
           </div>
         )}
+
+        {!loading && <IntelligencePanel districtName={selectedDistrict} />}
       </div>
     </div>
   );

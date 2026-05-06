@@ -19,6 +19,7 @@ const graphService         = require('./services/graphService');
 const { getRedisClient }   = require('./services/redisClient');
 const { initGtfsPoller }   = require('./services/gtfsPoller');
 const { connectMongo }     = require('./services/mongoClient');
+const { ensureBootstrapData } = require('./services/dbBootstrap');
 const { protect }          = require('./middleware/authMiddleware');
 const { enrichJourney }    = require('./services/journeyEnricher');
 const { errorHandler }     = require('./middleware/errorHandler');
@@ -179,7 +180,7 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
 app.get('/api/live/positions/:cityId', async (req, res, next) => {
   const { cityId } = req.params;
   try {
-    const keys = await redis.keys('pos:*');
+    const keys = await redis.keys(`pos:${cityId}:*`);
     if (keys.length === 0) {
       return res.json({ cityId, positions: [], message: 'No active vehicles at this time.' });
     }
@@ -248,10 +249,18 @@ server.listen(PORT, () => {
 
 pool.connect((err, client, release) => {
   if (err) return console.error('❌ Database Connection Error:', err.stack);
-  console.log('✅ Successfully connected to PostgreSQL + PostGIS');
-  initCronJobs(pool);
-  initGtfsPoller(pool, KOCHI_CITY_ID, redis, io);
-  release();
+  (async () => {
+    try {
+      const seededKochiCityId = await ensureBootstrapData(pool);
+      console.log('✅ Successfully connected to PostgreSQL + PostGIS');
+      initCronJobs(pool);
+      initGtfsPoller(pool, seededKochiCityId || KOCHI_CITY_ID, redis, io);
+    } catch (bootstrapErr) {
+      console.error('❌ Database bootstrap failed:', bootstrapErr.message);
+    } finally {
+      release();
+    }
+  })();
 });
 
 connectMongo();

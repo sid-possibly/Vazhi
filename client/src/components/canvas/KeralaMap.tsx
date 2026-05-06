@@ -70,7 +70,11 @@ function CameraRig({ zoomTarget }: { zoomTarget: THREE.Vector3 | null }) {
 }
 
 // 3. Main Map Component
-export default function KeralaMap() {
+export default function KeralaMap({
+  onDistrictSelect,
+}: {
+  onDistrictSelect?: (districtName: string | null) => void;
+}) {
   const [districts, setDistricts] = useState<GeoJSONFeature[]>([]);
   const [activeDistrict, setActiveDistrict] = useState<string | null>(null);
   const [zoomTarget, setZoomTarget] = useState<THREE.Vector3 | null>(null);
@@ -106,6 +110,7 @@ export default function KeralaMap() {
         rotation={[-Math.PI, 0, -1]}
         onPointerMissed={() => {
           setActiveDistrict(null);
+          onDistrictSelect?.(null);
           setZoomTarget(null); // Clicking void resets everything
         }}
       >
@@ -119,11 +124,13 @@ export default function KeralaMap() {
               isActive={activeDistrict === districtName}
               onClick={(centerPoint) => {
                 setActiveDistrict(districtName);
+                onDistrictSelect?.(districtName);
                 // Smart Pan: If already zoomed in, glide to the new district
                 if (zoomTarget) setZoomTarget(centerPoint);
               }}
               onDoubleClick={(centerPoint) => {
                 setActiveDistrict(districtName); // Ensure it highlights on double-click too
+                onDistrictSelect?.(districtName);
                 setZoomTarget(centerPoint);
               }}
             />
