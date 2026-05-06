@@ -1,19 +1,19 @@
 // services/gtfsPoller.js
 // Polls every 15 seconds:
-//   1. Interpolates vehicle positions from static schedules
-//   2. Writes positions to Redis
-//   3. Broadcasts transit_update via Socket.io
+//   1. Interpolates vehicle positions from static schedules (Kochi — no live GTFS-RT)
+//   2. Writes positions to Redis with 30s TTL
+//   3. Broadcasts transit_update to the city room (not all clients)
 //   4. Detects delays and writes alerts to PostgreSQL
 //   5. Broadcasts service_alert for Warning/Critical delays
-//   6. Auto-recalculates journeys for users whose active route is disrupted
+//   6. Auto-recalculates journeys for sessions affected by a disruption
 
 const cron = require('node-cron');
-const { findShortestPath } = require('../utils/routingEngine');
-const { enrichJourney }    = require('./journeyEnricher');
+const { findShortestPath }       = require('../utils/routingEngine');
+const { enrichJourney }          = require('./journeyEnricher');
+const { sendAlertToSubscribers } = require('./webPushService');
 
 const POLL_INTERVAL_SECONDS = 15;
 
-// Delay thresholds aligned with SRS severity labels
 const DELAY_INFO_MINS     = 2;
 const DELAY_WARNING_MINS  = 10;
 const DELAY_CRITICAL_MINS = 25;
@@ -24,9 +24,16 @@ const ALERT_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 const interpolateCoords = (lat1, lng1, lat2, lng2, progress) => ({
   lat: lat1 + (lat2 - lat1) * progress,
-  lng: lng1 + (lng2 - lng1) * progress,
+  lng: lng1 + (lng2 - lng1) * progress
 });
 
+/**
+ * Returns current time as seconds since midnight IST.
+ * NOTE: GTFS times in stop_times.txt can exceed 86400 (e.g. 25:00:00 = 90000s)
+ * for trips that run past midnight. The schedule query uses raw EXTRACT(EPOCH)
+ * which preserves these values. We use a day offset here to handle both normal
+ * and post-midnight trips correctly.
+ */
 const nowInSeconds = () => {
   const now       = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
@@ -41,11 +48,25 @@ const getSeverity = (delayMinutes) => {
   return null;
 };
 
-// ── Position interpolation ────────────────────────────────────────────────────
+// ── Position interpolation from static schedules ──────────────────────────────
+// Kochi Metro (KMRL) does not publish a live GTFS-RT Protobuf feed.
+// All vehicle positions are interpolated from the static GTFS schedule.
+// This satisfies FR4 and NFR3 (graceful degradation) from the SRS.
+//
+// Overnight trip handling:
+//   GTFS stop_times.txt allows times like "25:30:00" meaning 1:30 AM next day.
+//   EXTRACT(EPOCH FROM time_column) in PostgreSQL returns the raw value without
+//   wrapping at 86400, so "25:30:00" → 91800.
+//   We also query for seconds up to nowSeconds + 86400 to catch overnight trips
+//   that started the previous calendar day.
 
 const interpolatePositions = async (pool, cityId) => {
   const currentSeconds = nowInSeconds();
 
+  // We query two windows:
+  //   - normal trips:    trip_start <= now <= trip_end  (same day)
+  //   - overnight trips: trip_start <= now+86400 AND trip_end > 86400
+  // The HAVING clause covers both by checking a wide range.
   const { rows } = await pool.query(`
     WITH trip_bounds AS (
       SELECT
@@ -79,15 +100,16 @@ const interpolatePositions = async (pool, cityId) => {
 
   if (rows.length === 0) return [];
 
+  // Group rows by trip
   const tripMap = new Map();
   for (const row of rows) {
     if (!tripMap.has(row.trip_id)) {
       tripMap.set(row.trip_id, {
-        tripId:         row.trip_id,
-        routeId:        row.route_id,
-        gtfsRouteId:    row.gtfs_route_id,
-        routeColor:     row.route_color,
-        stops:          []
+        tripId:      row.trip_id,
+        routeId:     row.route_id,
+        gtfsRouteId: row.gtfs_route_id,
+        routeColor:  row.route_color,
+        stops:       []
       });
     }
     tripMap.get(row.trip_id).stops.push(row);
@@ -96,10 +118,10 @@ const interpolatePositions = async (pool, cityId) => {
   const positions = [];
 
   for (const [, trip] of tripMap) {
-    const stops        = trip.stops;
-    let prevStop       = null;
-    let nextStop       = null;
-    let delayMinutes   = 0;
+    const stops      = trip.stops;
+    let prevStop     = null;
+    let nextStop     = null;
+    let delayMinutes = 0;
 
     for (let i = 0; i < stops.length - 1; i++) {
       const dep = parseFloat(stops[i].departure_seconds);
@@ -107,6 +129,7 @@ const interpolatePositions = async (pool, cityId) => {
       if (currentSeconds >= dep && currentSeconds <= arr) {
         prevStop = stops[i];
         nextStop = stops[i + 1];
+        // Delay: how far past the scheduled arrival we are
         if (currentSeconds > arr) {
           delayMinutes = (currentSeconds - arr) / 60;
         }
@@ -114,6 +137,7 @@ const interpolatePositions = async (pool, cityId) => {
       }
     }
 
+    // Trip is active but between the last two stops — pin to last stop
     if (!prevStop) {
       const last = stops[stops.length - 1];
       positions.push({
@@ -165,6 +189,7 @@ const detectAndWriteAlerts = async (pool, cityId, positions, io) => {
     const severity = getSeverity(pos.delayMinutes);
     if (!severity) continue;
 
+    // Avoid duplicate active alerts for the same trip
     const { rows: existing } = await pool.query(`
       SELECT alert_id FROM alerts
       WHERE trip_id = $1 AND is_active = true AND expires_at > NOW()
@@ -186,7 +211,8 @@ const detectAndWriteAlerts = async (pool, cityId, positions, io) => {
     console.log(`🚨 Alert: [${severity}] ${message}`);
 
     if (severity === 'Warning' || severity === 'Critical') {
-      io.emit('service_alert', {
+      // Broadcast to the city room only
+      io.to(`city:${cityId}`).emit('service_alert', {
         alertId:      alert.alert_id,
         cityId,
         routeId:      pos.routeId,
@@ -197,6 +223,13 @@ const detectAndWriteAlerts = async (pool, cityId, positions, io) => {
         timestamp:    new Date().toISOString()
       });
 
+      // Web Push to subscribed users (fire and forget — never blocks the poll cycle)
+      sendAlertToSubscribers(pos.routeId, {
+        title:    `Vazhi: Route ${pos.routeId} Disruption`,
+        body:     message,
+        severity
+      }).catch(() => {}); // Already logs internally
+
       newAlerts.push({ routeId: pos.routeId, alert });
     }
   }
@@ -204,19 +237,15 @@ const detectAndWriteAlerts = async (pool, cityId, positions, io) => {
   return newAlerts;
 };
 
-// ── Journey auto-recalculate ──────────────────────────────────────────────────
-// When a Warning/Critical alert fires for a route, check if any active
-// journey sessions include that route. If so, re-run Dijkstra and push
-// the recalculated journey to that user's socket room.
+// ── Journey auto-recalculation ────────────────────────────────────────────────
 
 const recalculateAffectedJourneys = async (pool, graphService, cityId, newAlerts, io) => {
   if (newAlerts.length === 0) return;
 
   for (const { routeId } of newAlerts) {
     try {
-      // Find all active journey sessions that include this route
       const { rows: sessions } = await pool.query(`
-        SELECT session_id, user_id, socket_id, start_stop_id, end_stop_id, city_id
+        SELECT session_id, user_id, start_stop_id, end_stop_id, city_id
         FROM journey_sessions
         WHERE $1 = ANY(route_ids)
           AND expires_at > NOW()
@@ -224,16 +253,17 @@ const recalculateAffectedJourneys = async (pool, graphService, cityId, newAlerts
 
       if (sessions.length === 0) continue;
 
-      console.log(`🔄 Recalculating ${sessions.length} journey(s) affected by ${routeId} disruption`);
+      console.log(`🔄 Recalculating ${sessions.length} journey(s) affected by ${routeId}`);
 
       const graph = await graphService.getGraph(pool, cityId);
 
       for (const session of sessions) {
         try {
           const result = findShortestPath(graph, session.start_stop_id, session.end_stop_id);
+          const room   = `journey:${session.session_id}`;
 
-          if (result.totalTime === Infinity || result.path.length === 0) {
-            io.to(session.socket_id).emit('journey_recalculated', {
+          if (!result.success || result.path.length === 0) {
+            io.to(room).emit('journey_recalculated', {
               sessionId: session.session_id,
               success:   false,
               message:   'No alternative route found. Please check for service updates.'
@@ -243,7 +273,7 @@ const recalculateAffectedJourneys = async (pool, graphService, cityId, newAlerts
 
           const enriched = await enrichJourney(pool, result.path, result.totalTime, session.city_id);
 
-          io.to(session.socket_id).emit('journey_recalculated', {
+          io.to(room).emit('journey_recalculated', {
             sessionId:   session.session_id,
             success:     true,
             reason:      `Route ${routeId} disruption detected. Your journey has been recalculated.`,
@@ -277,16 +307,16 @@ const pollAndBroadcast = async (pool, cityId, redis, io, graphService) => {
       return;
     }
 
-    // Write to Redis
+    // Write positions to Redis with TTL (2× poll interval as buffer)
     const pipeline = redis.pipeline();
     for (const pos of positions) {
       const key = `pos:${pos.routeId}:${pos.tripId}`;
-      pipeline.set(key, JSON.stringify(pos), 'EX', POLL_INTERVAL_SECONDS);
+      pipeline.set(key, JSON.stringify(pos), 'EX', POLL_INTERVAL_SECONDS * 2);
     }
     await pipeline.exec();
 
-    // Broadcast positions
-    io.emit('transit_update', {
+    // Broadcast only to clients watching this city
+    io.to(`city:${cityId}`).emit('transit_update', {
       cityId,
       positions,
       timestamp: new Date().toISOString()
@@ -294,10 +324,7 @@ const pollAndBroadcast = async (pool, cityId, redis, io, graphService) => {
 
     console.log(`📡 Poller: Broadcast ${positions.length} vehicle positions.`);
 
-    // Detect delays and write alerts
     const newAlerts = await detectAndWriteAlerts(pool, cityId, positions, io);
-
-    // Auto-recalculate affected journeys
     await recalculateAffectedJourneys(pool, graphService, cityId, newAlerts, io);
 
   } catch (err) {
@@ -310,6 +337,7 @@ const pollAndBroadcast = async (pool, cityId, redis, io, graphService) => {
 const initGtfsPoller = (pool, cityId, redis, io, graphService) => {
   console.log(`🚦 GTFS Poller initialized for city: ${cityId}`);
 
+  // Run immediately on startup, then every 15 seconds
   pollAndBroadcast(pool, cityId, redis, io, graphService);
 
   cron.schedule(`*/${POLL_INTERVAL_SECONDS} * * * * *`, () => {

@@ -34,6 +34,7 @@ const analyticsRouter    = require('./routes/analyticsRoutes');
 const intelligenceRouter = require('./routes/intelligenceRoutes');
 const overviewRouter     = require('./routes/overviewRoutes');
 const comparisonRouter   = require('./routes/comparisonRoutes');
+const adminRouter        = require('./routes/adminRoutes');
 
 const app    = express();
 const server = http.createServer(app);
@@ -54,7 +55,7 @@ app.use(cors({
   credentials: true
 }));
 
-// ── HELMET ────────────────────────────────────────────────────────────────────
+// ── SECURITY ──────────────────────────────────────────────────────────────────
 
 app.use(helmet({ contentSecurityPolicy: false }));
 
@@ -72,29 +73,43 @@ const generalLimiter = rateLimit({
   standardHeaders: true, legacyHeaders: false
 });
 
-app.use('/api/auth', authLimiter);
-app.use('/api',      generalLimiter);
+// Tighter limiter specifically for citizen report submission
+const reportLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10,
+  message:         { error: 'Too many reports submitted. Please wait before filing another.' },
+  standardHeaders: true, legacyHeaders: false
+});
+
+app.use('/api/auth',           authLimiter);
+app.use('/api/reports',        reportLimiter);   // tighter — sits before generalLimiter
+app.use('/api',                generalLimiter);
 app.use(express.json({ limit: '10kb' }));
+
+// ── DB + REDIS INIT ───────────────────────────────────────────────────────────
 
 console.log('🛠️  Vazhi Backend Starting...');
 
 const pool  = new Pool({ connectionString: process.env.DATABASE_URL });
 const redis = getRedisClient();
 
-const KOCHI_CITY_ID = 'e79757c5-93d1-4230-85e3-90998123061c';
+// ── SOCKET.IO ─────────────────────────────────────────────────────────────────
 
 const io = new Server(server, {
   cors: { origin: allowedOrigins, methods: ['GET', 'POST'] }
 });
 
-// Inject pool and io into every request
+// ── REQUEST INJECTION ─────────────────────────────────────────────────────────
+// Attach pool, io, and redis to every request so route handlers
+// don't need to import them directly.
+
 app.use((req, res, next) => {
-  req.pool = pool;
-  req.io   = io;
+  req.pool  = pool;
+  req.io    = io;
+  req.redis = redis;
   next();
 });
 
-// ── SWAGGER UI ────────────────────────────────────────────────────────────────
+// ── SWAGGER ───────────────────────────────────────────────────────────────────
 
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   customSiteTitle: 'Vazhi API Docs',
@@ -109,11 +124,18 @@ app.get('/api/docs.json', (req, res) => {
 
 console.log('📖 API Docs available at http://localhost:5000/api/docs');
 
-// ── SOCKET.IO ─────────────────────────────────────────────────────────────────
+// ── SOCKET.IO EVENTS ──────────────────────────────────────────────────────────
 
 io.on('connection', (socket) => {
   console.log(`🔌 Client connected: ${socket.id}`);
 
+  // Client joins a city room so transit_update broadcasts are scoped correctly.
+  socket.on('join_city', (cityId) => {
+    socket.join(`city:${cityId}`);
+    console.log(`🏙️  Socket ${socket.id} joined city room: ${cityId}`);
+  });
+
+  // Client joins a journey room so journey_recalculated reaches reconnected clients.
   socket.on('join_journey', (sessionId) => {
     socket.join(`journey:${sessionId}`);
     console.log(`🗺️  Socket ${socket.id} joined journey session: ${sessionId}`);
@@ -135,6 +157,7 @@ app.use('/api/analytics',    analyticsRouter);
 app.use('/api/intelligence', intelligenceRouter);
 app.use('/api/overview',     overviewRouter);
 app.use('/api/comparison',   comparisonRouter);
+app.use('/api/admin',        adminRouter);
 
 // ── JOURNEY PLANNER ───────────────────────────────────────────────────────────
 
@@ -147,39 +170,38 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
     const graph = await graphService.getGraph(pool, cityId);
 
     if (Object.keys(graph).length === 0) {
-      return res.status(404).json({ success: false, message: 'No transit data available for this city.' });
+      return res.status(404).json({ error: 'No transit data available for this city.' });
     }
     if (!graph[startStopId]) {
-      return res.status(404).json({ success: false, message: `Start stop '${startStopId}' not found in transit graph.` });
+      return res.status(404).json({ error: `Start stop '${startStopId}' not found in transit graph.` });
+    }
+    if (startStopId === endStopId) {
+      return res.status(400).json({ error: 'Start and destination stops cannot be the same.' });
     }
 
     const result = findShortestPath(graph, startStopId, endStopId);
 
-    // Phase 1, Task 1 Fix: Handle no path found gracefully
-    if (!result.success || result.totalTime === Infinity || result.path.length === 0) {
-      return res.status(200).json({ 
-        success: false, 
-        message: 'No transit path found between these locations. Try adjusting your start or end points.',
-        fallback: 'GTFS Real-time or static data may be unavailable for this specific route.'
-      });
+    if (!result.success || result.path.length === 0) {
+      return res.status(404).json({ error: 'No path found between these stops.' });
     }
 
     const enriched = await enrichJourney(pool, result.path, result.totalTime, cityId);
 
+    // Collect transit route IDs for disruption monitoring
     const routeIds = enriched.legs
       .filter(l => l.type === 'transit')
       .map(l => l.routeId);
 
+    // Register journey session for auto-recalculation on disruption
     let sessionId = null;
     if (routeIds.length > 0) {
       const { rows } = await pool.query(`
         INSERT INTO journey_sessions
-          (user_id, socket_id, route_ids, start_stop_id, end_stop_id, city_id)
-        VALUES ($1, $2, $3, $4, $5, $6)
+          (user_id, route_ids, start_stop_id, end_stop_id, city_id)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING session_id
       `, [
-        req.user.userId,
-        req.headers['x-socket-id'] || 'unknown',
+        req.user.userId.toString(),
         routeIds,
         startStopId,
         endStopId,
@@ -189,12 +211,11 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
     }
 
     res.json({
-      success: true,
       origin:      startStopId,
       destination: endStopId,
-      sessionId,   
+      sessionId,   // Frontend: socket.emit('join_journey', sessionId)
       ...enriched,
-      timestamp: new Date().toISOString()
+      timestamp:   new Date().toISOString()
     });
 
   } catch (err) { next(err); }
@@ -203,11 +224,14 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
 // ── LIVE VEHICLE POSITIONS ────────────────────────────────────────────────────
 
 app.get('/api/live/positions/:cityId', async (req, res, next) => {
-  const { cityId } = req.params;
   try {
     const keys = await redis.keys('pos:*');
     if (keys.length === 0) {
-      return res.json({ cityId, positions: [], message: 'No active vehicles at this time.' });
+      return res.json({
+        cityId:    req.params.cityId,
+        positions: [],
+        message:   'No active vehicles at this time.'
+      });
     }
     const pipeline  = redis.pipeline();
     keys.forEach(key => pipeline.get(key));
@@ -215,11 +239,22 @@ app.get('/api/live/positions/:cityId', async (req, res, next) => {
     const positions = results
       .map(([err, val]) => (err || !val ? null : JSON.parse(val)))
       .filter(Boolean);
-    res.json({ cityId, positions, timestamp: new Date().toISOString() });
+
+    res.json({
+      cityId:    req.params.cityId,
+      positions,
+      timestamp: new Date().toISOString()
+    });
   } catch (err) { next(err); }
 });
 
-// ── GLOBAL ERROR HANDLER ──────────────────────────────────────────────────────
+// ── HEALTH CHECK (no auth, no rate limit) ─────────────────────────────────────
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'UP', uptime: process.uptime() });
+});
+
+// ── GLOBAL ERROR HANDLER — must be last ──────────────────────────────────────
 
 app.use(errorHandler);
 
@@ -231,12 +266,37 @@ server.listen(PORT, () => {
   console.log(`✅ Vazhi Intelligence Engine running on http://localhost:${PORT}`);
 });
 
-pool.connect((err, client, release) => {
-  if (err) return console.error('❌ Database Connection Error:', err.stack);
+// Connect to PostgreSQL, then start background services.
+// City ID is queried dynamically — never hardcoded — so it works on any
+// fresh database where the seed UUID might differ.
+pool.connect(async (err, client, release) => {
+  if (err) {
+    console.error('❌ Database Connection Error:', err.stack);
+    return;
+  }
   console.log('✅ Successfully connected to PostgreSQL + PostGIS');
-  initCronJobs(pool);
-  initGtfsPoller(pool, KOCHI_CITY_ID, redis, io, graphService);
   release();
+
+  try {
+    // Resolve Kochi city ID from the slug — safe even on a fresh schema
+    const { rows } = await pool.query(
+      `SELECT city_id FROM cities WHERE slug = $1`, ['kochi']
+    );
+
+    if (rows.length === 0) {
+      console.error('❌ Kochi city record not found. Run 001_schema.sql seed first.');
+      return;
+    }
+
+    const KOCHI_CITY_ID = rows[0].city_id;
+    console.log(`🏙️  Kochi city_id resolved: ${KOCHI_CITY_ID}`);
+
+    initCronJobs(pool);
+    initGtfsPoller(pool, KOCHI_CITY_ID, redis, io, graphService);
+
+  } catch (resolveErr) {
+    console.error('❌ Failed to resolve city ID:', resolveErr.message);
+  }
 });
 
 connectMongo();

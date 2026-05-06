@@ -2,7 +2,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
-const graphService = require('./graphService'); // Phase 1, Task 4 Fix
+const graphService = require('../Intelligence_platform/services/graphService'); // Phase 1, Task 4 Fix
 
 const formatGTFSTime = (timeStr) => {
   if (!timeStr) return null;
