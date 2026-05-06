@@ -1,12 +1,9 @@
-// realIngester.js
-const fs = require('fs');
+// services/realIngester.js
+const fs   = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
+const graphService = require('../Intelligence_platform/services/graphService'); // Phase 1, Task 4 Fix
 
-/**
- * Normalizes GTFS time strings that can exceed 23:xx (e.g. 25:10:00)
- * by wrapping hours with modulo 24.
- */
 const formatGTFSTime = (timeStr) => {
   if (!timeStr) return null;
   const parts = timeStr.trim().split(':');
@@ -14,39 +11,12 @@ const formatGTFSTime = (timeStr) => {
   return `${hours.toString().padStart(2, '0')}:${parts[1]}:${parts[2]}`;
 };
 
-/**
- * Builds a PostGIS LINESTRING WKT string from an array of shape points.
- * Points must already be sorted by shape_pt_sequence.
- * Returns null if fewer than 2 points (can't form a line).
- *
- * @param {Array} points - Array of { shape_pt_lat, shape_pt_lon }
- * @returns {string|null}
- */
-const buildLineStringWKT = (points) => {
-  if (points.length < 2) return null;
-  const coords = points
-    .map(p => `${parseFloat(p.shape_pt_lon)} ${parseFloat(p.shape_pt_lat)}`)
-    .join(', ');
-  return `LINESTRING(${coords})`;
-};
-
-/**
- * Ingests a full GTFS feed (routes, stops, trips, stop_times, shapes) for a
- * specific city + transport mode into PostgreSQL.
- *
- * @param {Pool}     pool          - pg Pool instance
- * @param {string}   citySlug      - e.g. 'kochi'
- * @param {string}   modeType      - e.g. 'Metro', 'Bus', 'Water'
- * @param {string}   folderPath    - path to the GTFS folder
- * @param {string[]} agencyFilter  - only ingest routes from these agency_ids (empty = ingest all)
- */
 const ingestGTFSForMode = async (pool, citySlug, modeType, folderPath, agencyFilter = []) => {
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
-    // ── Resolve city_id and mode_id from DB ──────────────────────────────
     const metaRes = await client.query(
       `SELECT c.city_id, m.mode_id
        FROM cities c
@@ -57,21 +27,16 @@ const ingestGTFSForMode = async (pool, citySlug, modeType, folderPath, agencyFil
 
     if (metaRes.rows.length === 0) {
       throw new Error(
-        `No DB record found for city slug '${citySlug}' and mode '${modeType}'. ` +
-        `Check your cities and transport_modes tables.`
+        `No DB record found for city slug '${citySlug}' and mode '${modeType}'.`
       );
     }
 
     const { city_id, mode_id } = metaRes.rows[0];
     console.log(`   city_id: ${city_id} | mode_id: ${mode_id}`);
 
-    // ── 1. ROUTES ────────────────────────────────────────────────────────
-    const routes = parse(
-      fs.readFileSync(path.join(folderPath, 'routes.txt')),
-      { columns: true, skip_empty_lines: true, trim: true }
-    );
-
-    const routeMap = new Map(); // gtfs_route_id → internal route_id
+    // 1. ROUTES
+    const routes = parse(fs.readFileSync(path.join(folderPath, 'routes.txt')), { columns: true, skip_empty_lines: true, trim: true });
+    const routeMap = new Map();
 
     for (const r of routes) {
       if (agencyFilter.length > 0 && !agencyFilter.includes(r.agency_id)) continue;
@@ -84,29 +49,14 @@ const ingestGTFSForMode = async (pool, citySlug, modeType, folderPath, agencyFil
                route_color      = EXCLUDED.route_color,
                mode_id          = EXCLUDED.mode_id
          RETURNING route_id`,
-        [
-          mode_id,
-          r.route_id,
-          r.route_short_name || r.route_long_name || r.route_id,
-          r.route_color ? `#${r.route_color.replace('#', '')}` : '#000000'
-        ]
+        [mode_id, r.route_id, r.route_short_name || r.route_long_name || r.route_id, r.route_color ? `#${r.route_color.replace('#', '')}` : '#000000']
       );
-
       routeMap.set(r.route_id, res.rows[0].route_id);
     }
-
     console.log(`   ✅ Routes ingested: ${routeMap.size}`);
 
-    // ── 2. STOPS ─────────────────────────────────────────────────────────
-    // mode_id is intentionally NOT stored on stops.
-    // A stop can be served by multiple modes (e.g. shared Bus + Water stops
-    // in the community feed). Mode is derived at query time via
-    // schedules → routes → transport_modes.
-    const stops = parse(
-      fs.readFileSync(path.join(folderPath, 'stops.txt')),
-      { columns: true, skip_empty_lines: true, trim: true }
-    );
-
+    // 2. STOPS
+    const stops = parse(fs.readFileSync(path.join(folderPath, 'stops.txt')), { columns: true, skip_empty_lines: true, trim: true });
     for (const s of stops) {
       await client.query(
         `INSERT INTO stops (city_id, gtfs_stop_id, stop_name, geom)
@@ -117,45 +67,27 @@ const ingestGTFSForMode = async (pool, citySlug, modeType, folderPath, agencyFil
         [city_id, s.stop_id, s.stop_name, parseFloat(s.stop_lon), parseFloat(s.stop_lat)]
       );
     }
-
     console.log(`   ✅ Stops ingested: ${stops.length}`);
 
-    // ── 3. TRIPS → build maps for route and shape linking ─────────────────
-    const trips = parse(
-      fs.readFileSync(path.join(folderPath, 'trips.txt')),
-      { columns: true, skip_empty_lines: true, trim: true }
-    );
-
-    const tripRouteMap = new Map(); // gtfs_trip_id → internal route_id
-    // shape_id → gtfs_route_id (first trip we see wins — one shape per route)
+    // 3. TRIPS
+    const trips = parse(fs.readFileSync(path.join(folderPath, 'trips.txt')), { columns: true, skip_empty_lines: true, trim: true });
+    const tripRouteMap  = new Map();
     const shapeRouteMap = new Map();
 
     for (const t of trips) {
       if (routeMap.has(t.route_id)) {
         tripRouteMap.set(t.trip_id, routeMap.get(t.route_id));
-
-        // Map this shape to the route — only store the first occurrence
         if (t.shape_id && !shapeRouteMap.has(t.shape_id)) {
           shapeRouteMap.set(t.shape_id, t.route_id);
         }
       }
     }
-
     console.log(`   ✅ Trips mapped: ${tripRouteMap.size}`);
-    console.log(`   ✅ Shapes to process: ${shapeRouteMap.size}`);
 
-    // ── 4. SHAPES → build LINESTRING and update route_shape ──────────────
-    // Read all shape points, group by shape_id, sort by sequence,
-    // build a LINESTRING WKT, then update the matching route row.
+    // 4. SHAPES
     const shapesPath = path.join(folderPath, 'shapes.txt');
-
     if (fs.existsSync(shapesPath)) {
-      const shapePoints = parse(
-        fs.readFileSync(shapesPath),
-        { columns: true, skip_empty_lines: true, trim: true }
-      );
-
-      // Group points by shape_id
+      const shapePoints = parse(fs.readFileSync(shapesPath), { columns: true, skip_empty_lines: true, trim: true });
       const shapeMap = new Map();
       for (const pt of shapePoints) {
         if (!shapeMap.has(pt.shape_id)) shapeMap.set(pt.shape_id, []);
@@ -163,75 +95,86 @@ const ingestGTFSForMode = async (pool, citySlug, modeType, folderPath, agencyFil
       }
 
       let shapesIngested = 0;
-
       for (const [shapeId, points] of shapeMap) {
         const gtfsRouteId = shapeRouteMap.get(shapeId);
-        if (!gtfsRouteId) continue; // Shape belongs to a filtered-out route
+        if (!gtfsRouteId) continue;
 
-        // Sort by sequence (handle both integer and float sequence values)
-        points.sort((a, b) =>
-          parseFloat(a.shape_pt_sequence) - parseFloat(b.shape_pt_sequence)
-        );
+        points.sort((a, b) => parseFloat(a.shape_pt_sequence) - parseFloat(b.shape_pt_sequence));
+        if (points.length < 2) continue;
 
-        const wkt = buildLineStringWKT(points);
-        if (!wkt) continue;
+        const coords = points.map(p => `${parseFloat(p.shape_pt_lon)} ${parseFloat(p.shape_pt_lat)}`).join(', ');
+        const wkt = `LINESTRING(${coords})`;
 
-        await client.query(
-          `UPDATE routes
-           SET route_shape = ST_SetSRID(ST_GeomFromText($1), 4326)
-           WHERE gtfs_route_id = $2`,
-          [wkt, gtfsRouteId]
-        );
-
+        await client.query(`UPDATE routes SET route_shape = ST_SetSRID(ST_GeomFromText($1), 4326) WHERE gtfs_route_id = $2`, [wkt, gtfsRouteId]);
         shapesIngested++;
       }
-
       console.log(`   ✅ Shapes ingested: ${shapesIngested}`);
-    } else {
-      console.log(`   ⚠️  No shapes.txt found — skipping shape ingestion.`);
     }
 
-    // ── 5. STOP_TIMES / SCHEDULES ────────────────────────────────────────
-    const stopTimes = parse(
-      fs.readFileSync(path.join(folderPath, 'stop_times.txt')),
-      { columns: true, skip_empty_lines: true, trim: true }
-    );
-
+    // 5. STOP TIMES / SCHEDULES
+    const stopTimes = parse(fs.readFileSync(path.join(folderPath, 'stop_times.txt')), { columns: true, skip_empty_lines: true, trim: true });
     let schedulesInserted = 0;
-    let schedulesSkipped = 0;
+    let schedulesSkipped  = 0;
 
     for (const st of stopTimes) {
       const dbRouteId = tripRouteMap.get(st.trip_id);
-      if (!dbRouteId) {
-        schedulesSkipped++;
-        continue;
-      }
+      if (!dbRouteId) { schedulesSkipped++; continue; }
 
       await client.query(
         `INSERT INTO schedules (stop_id, route_id, trip_id, arrival_time, departure_time, stop_sequence)
-         SELECT s.stop_id, $1, $2, $3, $4, $5
-         FROM stops s
-         WHERE s.gtfs_stop_id = $6
-           AND s.city_id = $7
-         LIMIT 1
+         SELECT s.stop_id, $1, $2, $3, $4, $5 FROM stops s WHERE s.gtfs_stop_id = $6 AND s.city_id = $7 LIMIT 1
          ON CONFLICT DO NOTHING`,
-        [
-          dbRouteId,
-          st.trip_id,
-          formatGTFSTime(st.arrival_time),
-          formatGTFSTime(st.departure_time),
-          parseInt(st.stop_sequence, 10),
-          st.stop_id,
-          city_id
-        ]
+        [dbRouteId, st.trip_id, formatGTFSTime(st.arrival_time), formatGTFSTime(st.departure_time), parseInt(st.stop_sequence, 10), st.stop_id, city_id]
       );
-
       schedulesInserted++;
     }
-
     console.log(`   ✅ Schedules inserted: ${schedulesInserted} | skipped: ${schedulesSkipped}`);
 
+    // 6. FARE ATTRIBUTES
+    const fareAttrsPath = path.join(folderPath, 'fare_attributes.txt');
+    if (fs.existsSync(fareAttrsPath)) {
+      const fareAttrs = parse(fs.readFileSync(fareAttrsPath), { columns: true, skip_empty_lines: true, trim: true });
+      for (const f of fareAttrs) {
+        await client.query(
+          `INSERT INTO fare_attributes (fare_id, city_id, price, currency_type, payment_method, transfers)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (fare_id) DO UPDATE
+             SET price = EXCLUDED.price, currency_type = EXCLUDED.currency_type, payment_method = EXCLUDED.payment_method, transfers = EXCLUDED.transfers`,
+          [f.fare_id, city_id, parseFloat(f.price), f.currency_type || 'INR', parseInt(f.payment_method || 0), f.transfers !== '' && f.transfers !== undefined ? parseInt(f.transfers) : null]
+        );
+      }
+      console.log(`   ✅ Fare attributes ingested: ${fareAttrs.length}`);
+    }
+
+    // 7. FARE RULES
+    const fareRulesPath = path.join(folderPath, 'fare_rules.txt');
+    if (fs.existsSync(fareRulesPath)) {
+      const fareRules = parse(fs.readFileSync(fareRulesPath), { columns: true, skip_empty_lines: true, trim: true });
+      await client.query(`DELETE FROM fare_rules WHERE route_id IN (SELECT r.route_id FROM routes r JOIN transport_modes tm ON tm.mode_id = r.mode_id WHERE tm.city_id = $1)`, [city_id]);
+
+      let fareRulesInserted = 0;
+      for (const fr of fareRules) {
+        const internalRouteId = fr.route_id ? routeMap.get(fr.route_id) || null : null;
+        await client.query(`INSERT INTO fare_rules (fare_id, route_id, origin_id, destination_id) VALUES ($1, $2, $3, $4)`, [fr.fare_id, internalRouteId, fr.origin_id || null, fr.destination_id || null]);
+        fareRulesInserted++;
+      }
+      console.log(`   ✅ Fare rules ingested: ${fareRulesInserted}`);
+    }
+
     await client.query('COMMIT');
+
+    // Phase 1, Task 4: Clear the graph cache after a successful DB commit
+    graphService.clearCache(city_id);
+
+    // 8. WRITE FEED METADATA
+    await pool.query(
+      `INSERT INTO gtfs_feed_metadata (city_id, mode_id, last_ingested_at, routes_count, stops_count, schedules_count)
+       VALUES ($1, $2, NOW(), $3, $4, $5)
+       ON CONFLICT (city_id, mode_id) DO UPDATE
+         SET last_ingested_at = NOW(), routes_count = EXCLUDED.routes_count, stops_count = EXCLUDED.stops_count, schedules_count = EXCLUDED.schedules_count`,
+      [city_id, mode_id, routeMap.size, stops.length, schedulesInserted]
+    );
+
     console.log(`✅ [${modeType}] Ingestion complete.\n`);
 
   } catch (err) {

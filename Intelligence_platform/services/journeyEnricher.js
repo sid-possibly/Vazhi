@@ -1,29 +1,15 @@
 // services/journeyEnricher.js
-//
-// Takes the flat array of gtfs_stop_ids from Dijkstra and enriches it into
-// a structured legs response:
-//
-//   - Transit legs: grouped by consecutive stops on the same mode/route
-//   - Walking legs: inserted between mode transfers, with TomTom turn-by-turn directions
-//
-// Flow:
-//   1. Bulk-fetch metadata for every stop in the path (name, coords, mode, route)
-//   2. Detect transfer points where the mode changes
-//   3. Group into transit legs
-//   4. Insert walking legs at each transfer using TomTom Routing API
-//   5. Return structured legs array
+// Enriches a flat Dijkstra path into structured legs with:
+//   - Transit legs grouped by route
+//   - Walking legs with TomTom turn-by-turn directions
+//   - Fare information per transit leg (from fare_rules + fare_attributes)
 
 const axios = require('axios');
 
-const WALKING_SPEED_MS = 1.4; // metres per second
+const WALKING_SPEED_MS = 1.4;
 
 // ── TomTom walking directions ─────────────────────────────────────────────────
 
-/**
- * Calls TomTom Routing API for pedestrian turn-by-turn directions.
- * Returns { durationSeconds, distanceMetres, instructions[] }
- * Falls back gracefully if the API call fails.
- */
 const getWalkingDirections = async (fromLat, fromLng, toLat, toLng) => {
   try {
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${fromLat},${fromLng}:${toLat},${toLng}/json`;
@@ -43,13 +29,11 @@ const getWalkingDirections = async (fromLat, fromLng, toLat, toLng) => {
     const guidance = route.guidance;
 
     const instructions = guidance
-      ? guidance.instructions
-          .filter(inst => inst.maneuver !== 'ARRIVE' || inst === guidance.instructions[guidance.instructions.length - 1])
-          .map(inst => ({
-            maneuver:    inst.maneuver,
-            message:     inst.message || inst.combinedMessage || '',
-            distanceMetres: inst.routeOffsetInMeters || 0
-          }))
+      ? guidance.instructions.map(inst => ({
+          maneuver:       inst.maneuver,
+          message:        inst.message || inst.combinedMessage || '',
+          distanceMetres: inst.routeOffsetInMeters || 0
+        }))
       : [];
 
     return {
@@ -59,17 +43,16 @@ const getWalkingDirections = async (fromLat, fromLng, toLat, toLng) => {
     };
 
   } catch (err) {
-    // Graceful fallback — estimate from straight-line distance
     console.warn(`⚠️  TomTom walking directions failed: ${err.message}. Using estimate.`);
 
-    const R = 6371000; // Earth radius in metres
+    const R    = 6371000;
     const dLat = (toLat - fromLat) * Math.PI / 180;
     const dLng = (toLng - fromLng) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) ** 2 +
-              Math.cos(fromLat * Math.PI / 180) *
-              Math.cos(toLat * Math.PI / 180) *
-              Math.sin(dLng / 2) ** 2;
-    const distanceMetres = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const a    = Math.sin(dLat / 2) ** 2 +
+                 Math.cos(fromLat * Math.PI / 180) *
+                 Math.cos(toLat   * Math.PI / 180) *
+                 Math.sin(dLng / 2) ** 2;
+    const distanceMetres  = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     const durationSeconds = distanceMetres / WALKING_SPEED_MS;
 
     return {
@@ -81,19 +64,71 @@ const getWalkingDirections = async (fromLat, fromLng, toLat, toLng) => {
   }
 };
 
-// ── Stop metadata fetcher ─────────────────────────────────────────────────────
+// ── Fare lookup ───────────────────────────────────────────────────────────────
 
 /**
- * Bulk-fetches stop metadata for all gtfs_stop_ids in the path.
- * Returns a Map: gtfs_stop_id → { name, lat, lng, modes: Set, routes: Map }
+ * Looks up the fare for a journey segment on a specific route.
+ * Uses fare_rules to find the fare_id for origin→destination pair,
+ * then fetches the price from fare_attributes.
  *
- * For each consecutive pair of stops, we also look up which route/mode
- * connects them via a shared trip.
+ * Falls back to route-level fare if origin/destination specific rule not found.
+ * Returns null if no fare data available for this route.
  */
+const lookupFare = async (pool, routeId, originGtfsId, destinationGtfsId) => {
+  try {
+    // Try origin+destination specific fare first
+    const { rows: specificRows } = await pool.query(`
+      SELECT fa.price, fa.currency_type, fr.fare_id
+      FROM fare_rules fr
+      JOIN fare_attributes fa ON fa.fare_id = fr.fare_id
+      WHERE fr.route_id = $1
+        AND fr.origin_id = $2
+        AND fr.destination_id = $3
+      LIMIT 1
+    `, [routeId, originGtfsId, destinationGtfsId]);
+
+    if (specificRows.length > 0) {
+      return {
+        fareId:       specificRows[0].fare_id,
+        price:        parseFloat(specificRows[0].price),
+        currencyType: specificRows[0].currency_type,
+        basis:        'origin_destination'
+      };
+    }
+
+    // Fall back to route-level fare (fare rule with no origin/destination)
+    const { rows: routeRows } = await pool.query(`
+      SELECT fa.price, fa.currency_type, fr.fare_id
+      FROM fare_rules fr
+      JOIN fare_attributes fa ON fa.fare_id = fr.fare_id
+      WHERE fr.route_id = $1
+        AND fr.origin_id IS NULL
+        AND fr.destination_id IS NULL
+      LIMIT 1
+    `, [routeId]);
+
+    if (routeRows.length > 0) {
+      return {
+        fareId:       routeRows[0].fare_id,
+        price:        parseFloat(routeRows[0].price),
+        currencyType: routeRows[0].currency_type,
+        basis:        'route'
+      };
+    }
+
+    return null; // No fare data for this route
+
+  } catch (err) {
+    console.warn(`⚠️  Fare lookup failed: ${err.message}`);
+    return null;
+  }
+};
+
+// ── Stop metadata fetcher ─────────────────────────────────────────────────────
+
 const fetchStopMetadata = async (pool, path, cityId) => {
   if (path.length === 0) return new Map();
 
-  // Fetch basic stop info
   const { rows: stopRows } = await pool.query(`
     SELECT gtfs_stop_id, stop_name, ST_Y(geom) AS lat, ST_X(geom) AS lng
     FROM stops
@@ -113,28 +148,21 @@ const fetchStopMetadata = async (pool, path, cityId) => {
   return stopMap;
 };
 
-/**
- * For each consecutive pair in the path, finds the mode and route that
- * connects them (i.e. they share a trip_id in the same sequence).
- * Returns an array of { from, to, mode, routeId, routeName, routeColor, travelTimeMinutes }
- */
+// ── Edge metadata fetcher ─────────────────────────────────────────────────────
+
 const fetchEdgeMetadata = async (pool, path) => {
   if (path.length < 2) return [];
 
-  // Build pairs
-  const pairs = [];
-  for (let i = 0; i < path.length - 1; i++) {
-    pairs.push([path[i], path[i + 1]]);
-  }
-
-  // For each pair, find if they're connected by a transit schedule (same trip, consecutive sequence)
-  // or if it's a walking transfer (no shared trip)
   const edgeResults = [];
 
-  for (const [fromId, toId] of pairs) {
+  for (let i = 0; i < path.length - 1; i++) {
+    const fromId = path[i];
+    const toId   = path[i + 1];
+
     const { rows } = await pool.query(`
       SELECT
         tm.type AS mode,
+        r.route_id AS internal_route_id,
         r.gtfs_route_id AS route_id,
         r.route_short_name AS route_name,
         r.route_color,
@@ -157,22 +185,18 @@ const fetchEdgeMetadata = async (pool, path) => {
 
     if (rows.length > 0) {
       edgeResults.push({
-        from:              fromId,
-        to:                toId,
-        type:              'transit',
-        mode:              rows[0].mode,
-        routeId:           rows[0].route_id,
-        routeName:         rows[0].route_name,
-        routeColor:        rows[0].route_color,
-        travelTimeMinutes: parseFloat(rows[0].travel_time_minutes)
+        from:               fromId,
+        to:                 toId,
+        type:               'transit',
+        mode:               rows[0].mode,
+        internalRouteId:    rows[0].internal_route_id,
+        routeId:            rows[0].route_id,
+        routeName:          rows[0].route_name,
+        routeColor:         rows[0].route_color,
+        travelTimeMinutes:  parseFloat(rows[0].travel_time_minutes)
       });
     } else {
-      // No transit schedule found — this is a walking transfer
-      edgeResults.push({
-        from: fromId,
-        to:   toId,
-        type: 'walking'
-      });
+      edgeResults.push({ from: fromId, to: toId, type: 'walking' });
     }
   }
 
@@ -181,118 +205,123 @@ const fetchEdgeMetadata = async (pool, path) => {
 
 // ── Main enricher ─────────────────────────────────────────────────────────────
 
-/**
- * Enriches a flat Dijkstra path into a structured legs array.
- *
- * @param {Pool}     pool    - pg Pool instance
- * @param {string[]} path    - Array of gtfs_stop_ids from Dijkstra
- * @param {number}   totalTime - Total travel time in minutes
- * @param {string}   cityId  - City UUID
- * @returns {Object}          - Structured journey response
- */
 const enrichJourney = async (pool, path, totalTime, cityId) => {
   if (path.length < 2) {
-    return { legs: [], totalTravelTimeMinutes: '0.00', transfers: 0 };
+    return { legs: [], totalTravelTimeMinutes: '0.00', transfers: 0, totalFare: null };
   }
 
-  // 1. Fetch all stop metadata and edge metadata in parallel
   const [stopMap, edges] = await Promise.all([
     fetchStopMetadata(pool, path, cityId),
     fetchEdgeMetadata(pool, path)
   ]);
 
-  // 2. Group consecutive transit edges with the same route into legs
-  //    Walking edges become their own legs
-  const rawLegs = [];
-  let currentLeg = null;
+  // Group consecutive transit edges with same route into legs
+  const rawLegs   = [];
+  let currentLeg  = null;
 
   for (const edge of edges) {
     const fromStop = stopMap.get(edge.from);
     const toStop   = stopMap.get(edge.to);
-
     if (!fromStop || !toStop) continue;
 
     if (edge.type === 'walking') {
-      // Flush current transit leg if any
-      if (currentLeg) {
-        rawLegs.push(currentLeg);
-        currentLeg = null;
-      }
-      // Add walking leg placeholder (directions fetched below)
-      rawLegs.push({
-        type:     'walking',
-        from:     fromStop,
-        to:       toStop,
-        fromId:   edge.from,
-        toId:     edge.to
-      });
+      if (currentLeg) { rawLegs.push(currentLeg); currentLeg = null; }
+      rawLegs.push({ type: 'walking', from: fromStop, to: toStop, fromId: edge.from, toId: edge.to });
 
     } else {
-      // Transit edge
-      if (
-        currentLeg &&
-        currentLeg.type === 'transit' &&
-        currentLeg.routeId === edge.routeId
-      ) {
-        // Extend current leg — same route continues
+      if (currentLeg && currentLeg.type === 'transit' && currentLeg.routeId === edge.routeId) {
         currentLeg.to = toStop;
         currentLeg.stops.push(toStop);
         currentLeg.durationMinutes += edge.travelTimeMinutes;
-
       } else {
-        // Flush previous leg and start a new one
         if (currentLeg) rawLegs.push(currentLeg);
-
         currentLeg = {
-          type:            'transit',
-          mode:            edge.mode,
-          routeId:         edge.routeId,
-          routeName:       edge.routeName,
-          routeColor:      edge.routeColor || '#000000',
-          from:            fromStop,
-          to:              toStop,
-          stops:           [fromStop, toStop],
-          durationMinutes: edge.travelTimeMinutes
+          type:               'transit',
+          mode:               edge.mode,
+          internalRouteId:    edge.internalRouteId,
+          routeId:            edge.routeId,
+          routeName:          edge.routeName,
+          routeColor:         edge.routeColor || '#000000',
+          from:               fromStop,
+          to:                 toStop,
+          stops:              [fromStop, toStop],
+          durationMinutes:    edge.travelTimeMinutes
         };
       }
     }
   }
-
-  // Flush last leg
   if (currentLeg) rawLegs.push(currentLeg);
 
-  // 3. Fetch TomTom walking directions for all walking legs in parallel
+  // Enrich walking legs with TomTom directions + transit legs with fare
   const enrichedLegs = await Promise.all(
     rawLegs.map(async (leg) => {
-      if (leg.type !== 'walking') return leg;
 
-      const directions = await getWalkingDirections(
-        leg.from.lat, leg.from.lng,
-        leg.to.lat,   leg.to.lng
+      if (leg.type === 'walking') {
+        const directions = await getWalkingDirections(
+          leg.from.lat, leg.from.lng,
+          leg.to.lat,   leg.to.lng
+        );
+        return {
+          type:            'walking',
+          from:            leg.from,
+          to:              leg.to,
+          durationMinutes: parseFloat((directions.durationSeconds / 60).toFixed(1)),
+          distanceMetres:  directions.distanceMetres,
+          instructions:    directions.instructions,
+          estimated:       directions.estimated || false
+        };
+      }
+
+      // Transit leg — look up fare
+      const fare = await lookupFare(
+        pool,
+        leg.internalRouteId,
+        leg.from.gtfsId,
+        leg.to.gtfsId
       );
 
       return {
-        type:            'walking',
+        type:            'transit',
+        mode:            leg.mode,
+        routeId:         leg.routeId,
+        routeName:       leg.routeName,
+        routeColor:      leg.routeColor,
         from:            leg.from,
         to:              leg.to,
-        durationMinutes: parseFloat((directions.durationSeconds / 60).toFixed(1)),
-        distanceMetres:  directions.distanceMetres,
-        instructions:    directions.instructions,
-        estimated:       directions.estimated || false
+        stops:           leg.stops,
+        durationMinutes: leg.durationMinutes,
+        fare
       };
     })
   );
 
-  // 4. Count transfers (number of mode changes, excluding walking legs)
-  const transitLegs = enrichedLegs.filter(l => l.type === 'transit');
-  const transfers   = Math.max(0, transitLegs.length - 1);
+  // Compute total fare across all transit legs
+  const transitLegs  = enrichedLegs.filter(l => l.type === 'transit');
+  const faresWithData = transitLegs.filter(l => l.fare !== null);
+
+  let totalFare = null;
+  if (faresWithData.length > 0) {
+    totalFare = {
+      amount:       faresWithData.reduce((s, l) => s + l.fare.price, 0),
+      currencyType: faresWithData[0].fare.currencyType,
+      breakdown:    faresWithData.map(l => ({
+        routeId: l.routeId,
+        mode:    l.mode,
+        amount:  l.fare.price
+      })),
+      isEstimate: faresWithData.length < transitLegs.length
+    };
+  }
+
+  const transfers  = Math.max(0, transitLegs.length - 1);
 
   return {
-    legs:                  enrichedLegs,
+    legs:                   enrichedLegs,
     totalTravelTimeMinutes: parseFloat(totalTime).toFixed(2),
     transfers,
-    transitLegs:           transitLegs.length,
-    walkingLegs:           enrichedLegs.filter(l => l.type === 'walking').length
+    transitLegs:            transitLegs.length,
+    walkingLegs:            enrichedLegs.filter(l => l.type === 'walking').length,
+    totalFare
   };
 };
 

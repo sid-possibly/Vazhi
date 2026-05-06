@@ -3,15 +3,26 @@ const express = require('express');
 const router  = express.Router();
 const { validateStopSearch } = require('../middleware/validation');
 
+const CITIES_CACHE_KEY = 'cache:cities';
+const CITIES_CACHE_TTL = 300; // 5 minutes
+
 // ── GET /api/transit/cities ───────────────────────────────────────────────────
+// Cached in Redis for 5 minutes — satisfies NFR1 (city config caching) from SRS.
 
 router.get('/cities', async (req, res, next) => {
   try {
+    // Try Redis cache first
+    const cached = await req.redis.get(CITIES_CACHE_KEY);
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+
     const { rows } = await req.pool.query(`
       SELECT
         c.city_id, c.name, c.slug, c.current_status,
         ST_X(c.center_coords) AS lng,
         ST_Y(c.center_coords) AS lat,
+        (SELECT MAX(last_ingested_at) FROM gtfs_feed_metadata WHERE city_id = c.city_id) AS "lastUpdated",
         JSON_AGG(
           JSON_BUILD_OBJECT(
             'modeId',        tm.mode_id,
@@ -25,7 +36,14 @@ router.get('/cities', async (req, res, next) => {
       GROUP BY c.city_id, c.name, c.slug, c.current_status, c.center_coords
       ORDER BY c.name
     `);
-    res.json({ cities: rows });
+
+    const payload = { cities: rows };
+
+    // Write to Redis cache — fire and forget (don't block the response)
+    req.redis.set(CITIES_CACHE_KEY, JSON.stringify(payload), 'EX', CITIES_CACHE_TTL)
+      .catch(err => console.error('Redis cache write failed:', err.message));
+
+    res.json(payload);
   } catch (err) { next(err); }
 });
 
@@ -55,7 +73,7 @@ router.get('/:cityId/routes', async (req, res, next) => {
       type: 'FeatureCollection',
       features: rows.map(row => ({
         type: 'Feature',
-        geometry: JSON.parse(row.shape_geojson),
+        geometry:   JSON.parse(row.shape_geojson),
         properties: {
           routeId:   row.route_id,
           gtfsId:    row.gtfs_route_id,
@@ -97,7 +115,7 @@ router.get('/:cityId/stops', async (req, res, next) => {
       type: 'FeatureCollection',
       features: rows.map(row => ({
         type: 'Feature',
-        geometry: JSON.parse(row.geom_geojson),
+        geometry:   JSON.parse(row.geom_geojson),
         properties: {
           stopId: row.stop_id,
           gtfsId: row.gtfs_stop_id,
@@ -110,7 +128,7 @@ router.get('/:cityId/stops', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /api/transit/:cityId/stops/search ────────────────────────────────────
+// ── GET /api/transit/:cityId/stops/search ─────────────────────────────────────
 
 router.get('/:cityId/stops/search', validateStopSearch, async (req, res, next) => {
   const { cityId }  = req.params;
@@ -137,7 +155,7 @@ router.get('/:cityId/stops/search', validateStopSearch, async (req, res, next) =
     rows.sort((a, b) => b.score - a.score);
 
     res.json({
-      query: q,
+      query:   q,
       results: rows.map(row => ({
         stopId: row.stop_id,
         gtfsId: row.gtfs_stop_id,
@@ -168,7 +186,7 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res, next) => {
           )) / 60
         ) AS minutes_away
       FROM schedules sch
-      JOIN stops s ON s.stop_id = sch.stop_id
+      JOIN stops s  ON s.stop_id  = sch.stop_id
       JOIN routes r ON r.route_id = sch.route_id
       JOIN transport_modes tm ON tm.mode_id = r.mode_id
       WHERE s.gtfs_stop_id = $1
@@ -179,7 +197,7 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res, next) => {
 
     res.json({
       gtfsStopId,
-      arrivals: rows.length === 0 ? [] : rows.map(row => ({
+      arrivals: rows.map(row => ({
         tripId:        row.trip_id,
         routeId:       row.gtfs_route_id,
         routeName:     row.route_short_name,
@@ -189,7 +207,9 @@ router.get('/stops/:gtfsStopId/arrivals', async (req, res, next) => {
         departureTime: row.departure_time,
         minutesAway:   parseInt(row.minutes_away)
       })),
-      message: rows.length === 0 ? 'No upcoming arrivals found for this stop today.' : undefined
+      message: rows.length === 0
+        ? 'No upcoming arrivals found for this stop today.'
+        : undefined
     });
   } catch (err) { next(err); }
 });
