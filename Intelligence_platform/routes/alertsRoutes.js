@@ -9,12 +9,14 @@ const router  = express.Router();
 // ==========================================
 // GET /api/alerts/:cityId
 // Returns all active non-expired alerts for a city.
-// Optional ?severity=critical|major|minor filter.
+// Optional ?severity=minor|major|critical filter.
 // ==========================================
 
 router.get('/:cityId', async (req, res) => {
-  const { cityId }   = req.params;
-  const { severity } = req.query;
+  const { cityId } = req.params;
+  const severity = typeof req.query.severity === 'string'
+    ? req.query.severity.toLowerCase()
+    : undefined;
 
   try {
     let query = `

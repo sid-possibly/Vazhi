@@ -40,7 +40,7 @@ export interface AlertItem {
   routeName: string;
   routeColor: string;
   tripId: string;
-  severity: 'critical' | 'major' | 'minor';
+  severity: 'minor' | 'major' | 'critical';
   message: string;
   delayMinutes: number;
   createdAt: string;
@@ -78,10 +78,14 @@ export interface JourneyLeg {
 export interface JourneyPlan {
   origin: string;
   destination: string;
+  sessionId?: string | null;
   totalTravelTimeMinutes: string;
   transfers: number;
-  transitLegs: number;
-  walkingLegs: number;
+  totalFare?: {
+    amount: number;
+    currencyType: string;
+    isEstimate: boolean;
+  } | null;
   legs: JourneyLeg[];
 }
 

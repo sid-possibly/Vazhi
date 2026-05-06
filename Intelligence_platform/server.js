@@ -10,7 +10,7 @@ const cors         = require('cors');
 const helmet       = require('helmet');
 const rateLimit    = require('express-rate-limit');
 const swaggerUi    = require('swagger-ui-express');
-const swaggerSpec  = require('./config/swaggerConfig');
+const swaggerSpec  = require('./config/Swaggerconfig');
 
 // Internal imports
 const { findShortestPath } = require('./utils/routingEngine');
@@ -199,8 +199,8 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
     if (routeIds.length > 0) {
       const { rows } = await pool.query(`
         INSERT INTO journey_sessions
-          (user_id, route_ids, start_stop_id, end_stop_id, city_id)
-        VALUES ($1, $2, $3, $4, $5)
+          (user_id, route_ids, start_stop_id, end_stop_id, city_id, expires_at)
+        VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '1 hour')
         RETURNING session_id
       `, [
         req.user.userId.toString(),
@@ -227,10 +227,11 @@ app.post('/api/journey/plan', protect, validateJourneyPlan, async (req, res, nex
 
 app.get('/api/live/positions/:cityId', async (req, res, next) => {
   try {
+    const { cityId } = req.params;
     const keys = await redis.keys(`pos:${cityId}:*`);
     if (keys.length === 0) {
       return res.json({
-        cityId:    req.params.cityId,
+        cityId,
         positions: [],
         message:   'No active vehicles at this time.'
       });
@@ -243,7 +244,7 @@ app.get('/api/live/positions/:cityId', async (req, res, next) => {
       .filter(Boolean);
 
     res.json({
-      cityId:    req.params.cityId,
+      cityId,
       positions,
       timestamp: new Date().toISOString()
     });
@@ -280,17 +281,7 @@ pool.connect(async (err, client, release) => {
   release();
 
   try {
-    // Resolve Kochi city ID from the slug — safe even on a fresh schema
-    const { rows } = await pool.query(
-      `SELECT city_id FROM cities WHERE slug = $1`, ['kochi']
-    );
-
-    if (rows.length === 0) {
-      console.error('❌ Kochi city record not found. Run 001_schema.sql seed first.');
-      return;
-    }
-
-    const KOCHI_CITY_ID = rows[0].city_id;
+    const KOCHI_CITY_ID = await ensureBootstrapData(pool);
     console.log(`🏙️  Kochi city_id resolved: ${KOCHI_CITY_ID}`);
 
     initCronJobs(pool);

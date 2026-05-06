@@ -155,12 +155,17 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
     setStatus('Loading Kochi routes, stops, alerts, and live positions...');
 
     try {
-      const [nextRoutes, nextStops, nextAlerts, nextPositions] = await Promise.all([
+      const [routesResult, stopsResult, alertsResult, positionsResult] = await Promise.allSettled([
         intelligenceApi.getRoutes(cityId),
         intelligenceApi.getStops(cityId),
         intelligenceApi.getAlerts(cityId),
         intelligenceApi.getLivePositions(cityId),
       ]);
+
+      const nextRoutes = routesResult.status === 'fulfilled' ? routesResult.value : [];
+      const nextStops = stopsResult.status === 'fulfilled' ? stopsResult.value : [];
+      const nextAlerts = alertsResult.status === 'fulfilled' ? alertsResult.value : [];
+      const nextPositions = positionsResult.status === 'fulfilled' ? positionsResult.value : [];
 
       setRoutes(nextRoutes);
       setStops(nextStops);
@@ -174,7 +179,22 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
       setEndStopId((current) => (current && nextStops.some((stop) => stop.properties.gtfsId === current) ? current : endDefault));
       setStartQuery('');
       setEndQuery('');
-      setStatus(`Loaded Kochi data: ${nextRoutes.length} routes, ${nextStops.length} stops, ${nextAlerts.length} alerts, ${nextPositions.length} live vehicles.`);
+      const failureMessages = [
+        routesResult.status === 'rejected' ? 'routes' : null,
+        stopsResult.status === 'rejected' ? 'stops' : null,
+        alertsResult.status === 'rejected' ? 'alerts' : null,
+        positionsResult.status === 'rejected' ? 'live positions' : null,
+      ].filter(Boolean);
+
+      if (nextRoutes.length === 0 && nextStops.length === 0) {
+        setStatus('Backend connected, but Kochi core transit data failed to load.');
+      } else {
+        setStatus(`Loaded Kochi data: ${nextRoutes.length} routes, ${nextStops.length} stops, ${nextAlerts.length} alerts, ${nextPositions.length} live vehicles.`);
+      }
+
+      if (failureMessages.length > 0) {
+        setError(`Failed to fetch ${failureMessages.join(', ')}.`);
+      }
     } catch (err) {
       setError(getErrorMessage(err));
       setStatus('Backend connected, but Kochi transit data failed to load.');
@@ -188,13 +208,17 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
 
     const interval = window.setInterval(async () => {
       try {
-        const [nextAlerts, nextPositions] = await Promise.all([
+        const [alertsResult, positionsResult] = await Promise.allSettled([
           intelligenceApi.getAlerts(selectedCityId),
           intelligenceApi.getLivePositions(selectedCityId),
         ]);
 
-        setAlerts(nextAlerts);
-        setPositions(nextPositions);
+        if (alertsResult.status === 'fulfilled') {
+          setAlerts(alertsResult.value);
+        }
+        if (positionsResult.status === 'fulfilled') {
+          setPositions(positionsResult.value);
+        }
       } catch {
         // Keep current data on transient failures.
       }
@@ -266,8 +290,14 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
 
     setIsJourneyBusy(true);
     setError('');
+    setFieldErrors({});
 
     try {
+      console.log('Journey planner payload', {
+        cityId: selectedCityId,
+        startStopId,
+        endStopId,
+      });
       const result = await intelligenceApi.getJourneyPlan(token, selectedCityId, startStopId, endStopId);
       setJourney(result);
       setStatus('Journey plan fetched from backend.');
@@ -393,6 +423,7 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
           onQueryChange={setStartQuery}
           onSelect={setStartStopId}
         />
+        {fieldErrors.startStopId && <p className="mt-1 text-xs text-rose-300">{fieldErrors.startStopId}</p>}
         {selectedStartStop && (
           <ArrivalsList title="Start arrivals" arrivals={startArrivals.arrivals} message={startArrivals.message} />
         )}
@@ -405,9 +436,12 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
           onQueryChange={setEndQuery}
           onSelect={setEndStopId}
         />
+        {fieldErrors.endStopId && <p className="mt-1 text-xs text-rose-300">{fieldErrors.endStopId}</p>}
         {selectedEndStop && (
           <ArrivalsList title="End arrivals" arrivals={endArrivals.arrivals} message={endArrivals.message} />
         )}
+
+        {fieldErrors.cityId && <p className="mt-2 text-xs text-rose-300">{fieldErrors.cityId}</p>}
 
         <button
           className="mt-3 w-full rounded bg-blue-500 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50"

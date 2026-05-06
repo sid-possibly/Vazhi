@@ -26,11 +26,11 @@ export class ApiError extends Error {
 
 const getJson = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
     headers: {
       'Content-Type': 'application/json',
       ...(init?.headers || {}),
     },
-    ...init,
   });
 
   const data = await response.json().catch(() => ({}));

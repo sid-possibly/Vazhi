@@ -10,6 +10,12 @@ const { body, query, param, validationResult } = require('express-validator');
 const handleValidation = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
+    if (req.originalUrl === '/api/journey/plan') {
+      console.error('⚠️ Journey validation failed:', {
+        body: req.body,
+        errors: errors.array().map(e => ({ field: e.path, message: e.msg, value: e.value }))
+      });
+    }
     return res.status(400).json({
       error:  'Validation failed.',
       errors: errors.array().map(e => ({ field: e.path, message: e.msg }))

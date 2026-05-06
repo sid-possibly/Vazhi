@@ -67,9 +67,9 @@ const initCronJobs = (pool) => {
         `, [city.city_id]);
 
         let newStatus = 'Operational';
-        if (alertRows.some(a => a.severity === 'Critical')) {
+        if (alertRows.some(a => a.severity === 'critical')) {
           newStatus = 'Disrupted';
-        } else if (alertRows.some(a => a.severity === 'Warning')) {
+        } else if (alertRows.some(a => a.severity === 'major')) {
           newStatus = 'Delayed';
         }
 

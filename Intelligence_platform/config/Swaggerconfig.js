@@ -57,7 +57,7 @@ const options = {
             routeName:    { type: 'string' },
             routeColor:   { type: 'string' },
             tripId:       { type: 'string' },
-            severity:     { type: 'string', enum: ['Info', 'Warning', 'Critical'] },
+            severity:     { type: 'string', enum: ['minor', 'major', 'critical'] },
             message:      { type: 'string' },
             delayMinutes: { type: 'integer' },
             createdAt:    { type: 'string', format: 'date-time' },
@@ -258,7 +258,7 @@ const options = {
           summary: 'All active alerts for a city',
           parameters: [
             { name: 'cityId',   in: 'path',  required: true,  schema: { type: 'string' } },
-            { name: 'severity', in: 'query', required: false, schema: { type: 'string', enum: ['Info', 'Warning', 'Critical'] } }
+            { name: 'severity', in: 'query', required: false, schema: { type: 'string', enum: ['minor', 'major', 'critical'] } }
           ],
           responses: { 200: { description: 'Active alerts list', content: { 'application/json': { schema: { type: 'object', properties: { alerts: { type: 'array', items: { '$ref': '#/components/schemas/Alert' } } } } } } } }
         }

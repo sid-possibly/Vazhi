@@ -4,7 +4,7 @@
 //   2. Writes positions to Redis with 30s TTL
 //   3. Broadcasts transit_update to the city room (not all clients)
 //   4. Detects delays and writes alerts to PostgreSQL
-//   5. Broadcasts service_alert for Warning/Critical delays
+//   5. Broadcasts service_alert for major/critical delays
 //   6. Auto-recalculates journeys for sessions affected by a disruption
 
 const cron = require('node-cron');
@@ -42,9 +42,9 @@ const nowInSeconds = () => {
 };
 
 const getSeverity = (delayMinutes) => {
-  if (delayMinutes >= DELAY_CRITICAL_MINS) return 'Critical';
-  if (delayMinutes >= DELAY_WARNING_MINS)  return 'Warning';
-  if (delayMinutes >= DELAY_INFO_MINS)     return 'Info';
+  if (delayMinutes >= DELAY_CRITICAL_MINS) return 'critical';
+  if (delayMinutes >= DELAY_WARNING_MINS)  return 'major';
+  if (delayMinutes >= DELAY_INFO_MINS)     return 'minor';
   return null;
 };
 
@@ -212,7 +212,7 @@ const detectAndWriteAlerts = async (pool, cityId, positions, io) => {
     const alert = rows[0];
     console.log(`🚨 Alert: [${severity}] ${message}`);
 
-    if (severity === 'Warning' || severity === 'Critical') {
+    if (severity === 'major' || severity === 'critical') {
       // Broadcast to the city room only
       io.to(`city:${cityId}`).emit('service_alert', {
         alertId:      alert.alert_id,
@@ -312,7 +312,7 @@ const pollAndBroadcast = async (pool, cityId, redis, io, graphService) => {
     // Write positions to Redis with TTL (2× poll interval as buffer)
     const pipeline = redis.pipeline();
     for (const pos of positions) {
-      const key = `pos:${pos.routeId}:${pos.tripId}`;
+      const key = `pos:${cityId}:${pos.tripId}`;
       pipeline.set(key, JSON.stringify(pos), 'EX', POLL_INTERVAL_SECONDS * 2);
     }
     await pipeline.exec();

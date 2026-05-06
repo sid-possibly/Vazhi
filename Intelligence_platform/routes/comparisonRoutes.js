@@ -52,9 +52,9 @@ const getCityMetrics = async (pool, cityId) => {
     pool.query(`
       SELECT
         COUNT(*)                                          AS total_disruptions,
-        COUNT(*) FILTER (WHERE severity = 'Critical')    AS critical_count,
-        COUNT(*) FILTER (WHERE severity = 'Warning')     AS warning_count,
-        COUNT(*) FILTER (WHERE severity = 'Info')        AS info_count,
+        COUNT(*) FILTER (WHERE severity = 'critical')    AS critical_count,
+        COUNT(*) FILTER (WHERE severity = 'major')       AS warning_count,
+        COUNT(*) FILTER (WHERE severity = 'minor')       AS info_count,
         AVG(delay_minutes)                               AS avg_delay_when_disrupted
       FROM alerts
       WHERE city_id = $1

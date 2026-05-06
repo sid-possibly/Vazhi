@@ -56,8 +56,8 @@ router.get('/metrics', async (req, res, next) => {
       // 2. Total active disruptions across all cities
       req.pool.query(`
         SELECT COUNT(*) AS total_disruptions,
-               COUNT(*) FILTER (WHERE severity = 'Critical') AS critical_count,
-               COUNT(*) FILTER (WHERE severity = 'Warning')  AS warning_count
+               COUNT(*) FILTER (WHERE severity = 'critical') AS critical_count,
+               COUNT(*) FILTER (WHERE severity = 'major')    AS warning_count
         FROM alerts
         WHERE is_active = true AND expires_at > NOW()
       `),

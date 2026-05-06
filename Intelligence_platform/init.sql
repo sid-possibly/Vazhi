@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS routes (
     route_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     mode_id UUID REFERENCES transport_modes(mode_id) ON DELETE CASCADE,
     gtfs_route_id VARCHAR(100) UNIQUE NOT NULL,
-    route_short_name VARCHAR(50),
+    route_short_name TEXT,
     route_color VARCHAR(7) DEFAULT '#000000',
     route_shape GEOMETRY(LINESTRING, 4326)
 );
@@ -146,9 +146,18 @@ CREATE TABLE IF NOT EXISTS journey_sessions (
     end_stop_id VARCHAR(100) NOT NULL,
     city_id UUID REFERENCES cities(city_id),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW() + INTERVAL '1 hour'
 );
 
+CREATE TABLE IF NOT EXISTS fare_attributes (
+    fare_id VARCHAR(255) PRIMARY KEY,
+    price NUMERIC NOT NULL,
+    currency_type VARCHAR(3) NOT NULL,
+    payment_method INT NOT NULL,
+    transfers INT,
+    agency_id VARCHAR(255),
+    transfer_duration INT
+);
 -- ==========================================
 -- 4. INDEXES (Crucial for Map Performance)
 -- ==========================================
