@@ -312,6 +312,19 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
     }
   };
 
+  const handleLogout = () => {
+    clearStoredTokens();
+    setProfileName('');
+    setJourney(null);
+    setStatus('Logged out successfully.');
+    setEmail('');
+    setPassword('');
+    setName('');
+    setAuthMode('login');
+    setFieldErrors({});
+    setError('');
+  };
+
   const handleApiError = (err: unknown) => {
     const message = getErrorMessage(err);
     const errors = err instanceof ApiError ? err.fields : [];
@@ -320,10 +333,10 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
   };
 
   return (
-    <aside className="absolute right-4 top-4 z-20 w-[380px] max-h-[calc(100vh-2rem)] overflow-y-auto rounded-2xl border border-teal-500/30 bg-slate-950/80 p-4 text-white shadow-[0_0_40px_rgba(13,148,136,0.2)] backdrop-blur-xl">
+    <aside className="absolute right-4 top-4 z-20 w-[380px] max-h-[calc(100vh-2rem)] overflow-y-auto border border-teal-500/30 bg-slate-950/80 !p-2 text-white shadow-[0_0_40px_rgba(13,148,136,0.35)] backdrop-blur-xl ">
       <div className="mb-4">
-        <p className="text-[10px] uppercase tracking-[0.35em] text-teal-300/70">Frontend x Backend</p>
-        <h2 className="mt-2 text-2xl font-black tracking-tight">Integration Panel</h2>
+        <p className="text-[10px] uppercase tracking-[0.35em] text-teal-300/70">Vazhi Transit</p>
+        <h2 className="mt-2 text-2xl font-black tracking-tight">Intelligence Panel</h2>
         <p className="mt-2 text-sm text-slate-300">{status}</p>
         {districtName && districtName !== KOCHI_DISTRICT && (
           <p className="mt-2 text-xs text-amber-300">You clicked {districtName}. Only Kochi transit data is available right now, mapped to Ernakulam.</p>
@@ -331,21 +344,30 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
         {error && <p className="mt-2 text-sm text-rose-300">{error}</p>}
       </div>
 
-      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-        <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Backend</p>
-        <p className="mt-2 text-sm text-slate-200">{intelligenceApi.baseUrl}</p>
+      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-4">
+        {/* <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Backend</p>
+        <p className="mt-2 text-sm text-slate-200">{intelligenceApi.baseUrl}</p> */}
         <p className="mt-2 text-sm text-slate-400">
           City: <span className="text-white">{selectedCity?.name || 'Not selected'}</span>
         </p>
         <p className="text-sm text-slate-400">
           Modes: <span className="text-white">{selectedCity?.modes?.map((mode) => mode.type).join(', ') || 'Not loaded'}</span>
         </p>
-        <p className="text-sm text-slate-400">
+        {/* <p className="text-sm text-slate-400">
           Routes {routes.length} | Stops {stops.length} | Alerts {alerts.length} | Live {positions.length}
-        </p>
+        </p> */}
+
+        <div className="mt-3 grid grid-cols-4 gap-1 text-center">
+          {[['Routes', routes.length], ['Stops', stops.length], ['Alerts', alerts.length], ['Live', positions.length]].map(([label, val]) => (
+            <div key={label as string} className="rounded bg-slate-950/60 py-1.5">
+              <p className="text-base font-bold text-teal-400">{val}</p>
+              <p className="text-[10px] text-slate-500">{label}</p>
+            </div>
+          ))}
+        </div>
       </section>
 
-      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
+      {/* <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
         <div className="flex gap-2 text-xs">
           <button
             className={`rounded px-3 py-1 ${authMode === 'login' ? 'bg-teal-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
@@ -411,10 +433,88 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
         <p className="mt-2 text-xs text-slate-400">
           User: <span className="text-white">{profileName || 'Guest'}</span>
         </p>
+      </section> */}
+
+
+      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-4">
+        <p className="text-xs uppercase tracking-[0.25em] text-teal-400/60 !mb-1 !mt-2 font-semibold">Account</p>
+
+        {isAuthenticated ? (
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-semibold text-white">{profileName}</p>
+              <p className="text-xs text-slate-400">Logged in</p>
+            </div>
+            <button
+              className="rounded bg-rose-500/20 border border-rose-500/40 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-500/30 transition-colors"
+              onClick={handleLogout}
+              type="button"
+            >
+              Logout
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="flex gap-2 text-xs mb-3">
+              <button
+                className={`rounded !px-3 py-1 ${authMode === 'login' ? 'bg-teal-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
+                onClick={() => { setAuthMode('login'); setFieldErrors({}); setError(''); }}
+                type="button"
+              >
+                Login
+              </button>
+              <button
+                className={`rounded !px-3 py-1 ${authMode === 'register' ? 'bg-teal-500 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
+                onClick={() => { setAuthMode('register'); setFieldErrors({}); setError(''); }}
+                type="button"
+              >
+                Register
+              </button>
+            </div>
+
+            {authMode === 'register' && (
+              <>
+                <input
+                  className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none mb-1"
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Name"
+                  value={name}
+                />
+                {fieldErrors.name && <p className="mb-2 text-xs text-rose-300">{fieldErrors.name}</p>}
+              </>
+            )}
+
+            <input
+              className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none mb-1"
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="Email"
+              value={email}
+            />
+            {fieldErrors.email && <p className="mb-2 text-xs text-rose-300">{fieldErrors.email}</p>}
+
+            <input
+              className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none mb-1"
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Password"
+              type="password"
+              value={password}
+            />
+            {fieldErrors.password && <p className="mb-2 text-xs text-rose-300">{fieldErrors.password}</p>}
+
+            <button
+              className="mt-1 w-full rounded bg-teal-400 px-3 py-2 text-sm font-semibold text-slate-950 disabled:opacity-50"
+              disabled={isAuthBusy}
+              onClick={authMode === 'login' ? handleLogin : handleRegister}
+              type="button"
+            >
+              {isAuthBusy ? 'Please wait...' : authMode === 'login' ? 'Login' : 'Create Account'}
+            </button>
+          </>
+        )}
       </section>
 
-      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-        <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Journey</p>
+      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-4">
+        <p className="text-xs uppercase tracking-[0.25em] text-teal-400/60 !mb-1 !mt-2 font-semibold">Journey</p>
         <StopSelector
           label="Start stop"
           query={startQuery}
@@ -423,7 +523,7 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
           onQueryChange={setStartQuery}
           onSelect={setStartStopId}
         />
-        {fieldErrors.startStopId && <p className="mt-1 text-xs text-rose-300">{fieldErrors.startStopId}</p>}
+        {fieldErrors.startStopId && <p className="!mt-1 text-xs text-rose-300">{fieldErrors.startStopId}</p>}
         {selectedStartStop && (
           <ArrivalsList title="Start arrivals" arrivals={startArrivals.arrivals} message={startArrivals.message} />
         )}
@@ -468,8 +568,8 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
         )}
       </section>
 
-      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-        <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Route Snapshot</p>
+      <section className="mb-4 rounded-xl border border-slate-800 bg-slate-900/80 p-4">
+        <p className="text-xs uppercase tracking-[0.25em] text-teal-400/60 !mb-1 !mt-2 font-semibold">Route Snapshot</p>
         {routes.length > 0 ? (
           <div className="mt-2 flex flex-wrap gap-2">
             {routes.slice(0, 8).map((route) => (
@@ -483,8 +583,8 @@ export default function IntelligencePanel({ districtName }: IntelligencePanelPro
         )}
       </section>
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-        <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Live Feed</p>
+      <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-4">
+        <p className="text-xs uppercase tracking-[0.25em] text-teal-400/60 !mb-1 !mt-2 font-semibold">Live Feed</p>
         <div className="mt-3 space-y-2">
           {alerts.length > 0 ? alerts.slice(0, 3).map((alert) => <AlertRow key={alert.alertId} alert={alert} />) : (
             <p className="text-sm text-slate-400">{isDataBusy ? 'Loading alerts...' : 'No active alerts right now.'}</p>
@@ -527,7 +627,7 @@ function StopSelector({
       <input
         className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none"
         onChange={(e) => onQueryChange(e.target.value)}
-        placeholder={`Search ${label.toLowerCase()}`}
+        placeholder={` ${label.toLowerCase()}`}
         value={query}
       />
       <select
