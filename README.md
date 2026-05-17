@@ -121,7 +121,7 @@ Handles:
 - OpenWeatherMap API
 - TomTom Traffic API
 
----
+----
 
 # 📂 Repository Structure
 
